@@ -2,7 +2,7 @@
    If ANYTHING crashes, a red banner shows the actual error message on
    screen instead of the app silently dying. The build number makes it
    possible to verify which version a device is actually running. */
-const BUILD = 'v12';
+const BUILD = 'v13';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -24,7 +24,7 @@ window.addEventListener('unhandledrejection', e => showFatal(String((e.reason &&
           Orders · Customers
    ============================================================ */
 
-const STATUSES = ['In production', 'Ready for shipping', 'Completed', 'Delivered'];
+const STATUSES = ['In production', 'Ready for shipping', 'Shipped', 'Delivered'];
 const fmtMoney = n => '฿' + (n || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
 const fmtDate = ts => {
   const d = new Date(ts);
@@ -588,10 +588,10 @@ async function renderHome() {
         <div class="value">${openTotal}</div>
         <div class="hint">${inProduction} in production · ${readyToShip} ready</div>
       </div>
-      <div class="stat-card tappable" data-goto="orders" data-status="Completed">
-        <div class="label">To ship</div>
+      <div class="stat-card tappable" data-goto="orders" data-status="Shipped">
+        <div class="label">Shipped</div>
         <div class="value">${completed}</div>
-        <div class="hint">completed, awaiting delivery</div>
+        <div class="hint">on the way, not delivered yet</div>
       </div>
       ${bankBalance !== null ? `
       <div class="stat-card tappable" data-goto="money" data-moneysub="bank" style="grid-column:1/-1">
@@ -1084,7 +1084,7 @@ async function renderProducts() {
         <div class="row">
           <div class="row-main">
             <div class="name">${esc(p.name)}</div>
-            <div class="sub">${esc(p.sku || 'No SKU')} · ${fmtMoney(p.price)} / ${p.unit === 'weight' ? 'kg' : 'unit'}</div>
+            <div class="sub">${esc(p.sku || 'No SKU')} · ${p.unit === 'weight' ? fmtMoney(p.price / 2) + ' / 500g' : fmtMoney(p.price) + ' / unit'}</div>
             ${stockBadge(p)}
           </div>
           <div class="row-end">
@@ -1344,7 +1344,7 @@ async function openProductForm(id) {
       <label class="field"><span>Name</span><input id="pfName" value="${esc(p.name)}" placeholder="e.g. Oak shelf 80 cm"></label>
       <div class="field-row">
         <label class="field"><span>SKU (optional)</span><input id="pfSku" value="${esc(p.sku || '')}" placeholder="OAK-80"></label>
-        <label class="field"><span id="pfPriceLabel">${unitType === 'weight' ? 'Price per kg (฿)' : 'Unit price (฿)'}</span><input id="pfPrice" type="number" min="0" step="1" inputmode="numeric" value="${p.price}"></label>
+        <label class="field"><span id="pfPriceLabel">${unitType === 'weight' ? 'Price per 500g (฿)' : 'Unit price (฿)'}</span><input id="pfPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${unitType === 'weight' ? p.price / 2 : p.price}"></label>
       </div>
       <label class="field"><span>Unit type</span>
         <select id="pfUnitType">
@@ -1354,7 +1354,7 @@ async function openProductForm(id) {
       </label>
       <div id="pfPackWrap">${unitType === 'weight' ? `
         <label class="field"><span>Pack size on receipt (g) — e.g. 500 shows “(500g ฿…)”</span>
-          <input id="pfPack" type="number" min="1" inputmode="numeric" value="${p.packG || 1000}">
+          <input id="pfPack" type="number" min="1" inputmode="numeric" value="${p.packG || 500}">
         </label>` : ''}
       </div>
       <label class="field"><span>Stock handling</span>
@@ -1375,8 +1375,8 @@ async function openProductForm(id) {
 
   function redraw() {
     $('#pfStockFields').innerHTML = stockFieldsHTML($('#pfUnitType').value, $('#pfStockMode').value === 'tracked');
-    $('#pfPriceLabel').textContent = $('#pfUnitType').value === 'weight' ? 'Price per kg (฿)' : 'Unit price (฿)';
-    const curPack = $('#pfPack') ? Number($('#pfPack').value) || 1000 : (p.packG || 1000);
+    $('#pfPriceLabel').textContent = $('#pfUnitType').value === 'weight' ? 'Price per 500g (฿)' : 'Unit price (฿)';
+    const curPack = $('#pfPack') ? Number($('#pfPack').value) || 500 : (p.packG || 500);
     $('#pfPackWrap').innerHTML = $('#pfUnitType').value === 'weight' ? `
       <label class="field"><span>Pack size on receipt (g) — e.g. 500 shows “(500g ฿…)”</span>
         <input id="pfPack" type="number" min="1" inputmode="numeric" value="${curPack}">
@@ -1402,7 +1402,10 @@ async function openProductForm(id) {
 
   $('#pfSave').onclick = async () => {
     const name = $('#pfName').value.trim();
-    const price = Number($('#pfPrice').value);
+    const priceInput = Number($('#pfPrice').value);
+    // Weight products are entered per 500g but stored per kg internally,
+    // so existing orders and totals keep their exact meaning.
+    const price = $('#pfUnitType') && $('#pfUnitType').value === 'weight' ? Math.round(priceInput * 2) : priceInput;
     if (!name) return snack('Give the product a name');
     if (!(price >= 0)) return snack('Enter a valid unit price');
 
@@ -1426,7 +1429,7 @@ async function openProductForm(id) {
       name, sku: $('#pfSku').value.trim(), price, trackStock, stockMode: mode,
       unit: finalUnitType, stock, lowStock,
       excludeReports: $('#pfExclude').checked,
-      packG: finalUnitType === 'weight' ? Math.max(1, Number($('#pfPack') && $('#pfPack').value) || 1000) : undefined,
+      packG: finalUnitType === 'weight' ? Math.max(1, Number($('#pfPack') && $('#pfPack').value) || 500) : undefined,
       isDelivery: p.isDelivery || false
     };
     const savedId = await DB.put('products', record);
@@ -1457,7 +1460,7 @@ function railHTML(order) {
     <div class="rail">
       ${STATUSES.map((s, i) => `<div class="rail-seg ${i < idx ? 'is-done' : i === idx ? (idx === last ? 'is-done' : 'is-current') : ''}"></div>`).join('')}
     </div>
-    <div class="rail-labels"><span>Production</span><span>Ready</span><span>Completed</span><span>Delivered</span></div>
+    <div class="rail-labels"><span>Production</span><span>Ready</span><span>Shipped</span><span>Delivered</span></div>
     <div class="rail-status ${idx === last ? 'is-completed' : ''}">${order.status}</div>
     ${idx < last ? `<button class="advance-btn" data-advance="${order.id}">Mark as “${STATUSES[idx + 1]}”</button>` : ''}`;
 }
@@ -1544,7 +1547,7 @@ function buildReceipt(order, products) {
     const lt = i.lineTotal !== undefined ? i.lineTotal : i.qty * i.unitPrice;
     if (i.unitType === 'weight') {
       const p = products.find(x => x.id === i.productId);
-      const pack = (p && p.packG) || 1000;
+      const pack = (p && p.packG) || 500;
       const packPrice = Math.round(i.unitPrice * pack / 1000);
       return `1x ${i.name} (${pack}g ฿${fmtN(packPrice)}) = ${i.qty}g ฿${fmtN(lt)}`;
     }
@@ -1666,10 +1669,10 @@ async function openOrderEdit(o) {
       <div class="line-item" style="margin-bottom:2px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Weight (g)</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
-        <label class="field"><span>฿ / kg</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="1" inputmode="numeric" value="${l.unitPrice}"></label>
+        <label class="field"><span>฿ / 500g</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${l.unitPrice / 2}"></label>
         <button class="remove" data-rm="${i}" title="Remove item">✕</button>
       </div>
-      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney(l.unitPrice || 0)}/kg, rounded down)</div>` : `
+      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney((l.unitPrice || 0) / 2)}/500g, rounded down)</div>` : `
       <div class="line-item" style="margin-bottom:10px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Qty</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
@@ -1679,14 +1682,14 @@ async function openOrderEdit(o) {
 
     linesEl.querySelectorAll('[data-li]').forEach(el => el.addEventListener('input', () => {
       const i = Number(el.dataset.li), k = el.dataset.k;
-      lines[i][k] = Number(el.value);
+      lines[i][k] = (k === 'unitPrice' && lines[i].weightBased) ? Number(el.value) * 2 : Number(el.value);
       if (k === 'productId') {
         const p = products.find(p => p.id === lines[i].productId);
         lines[i] = newLine(p);
         drawLines();
       } else if (lines[i].weightBased) {
         const hint = el.closest('.line-item').nextElementSibling;
-        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney(lines[i].unitPrice || 0)}/kg, rounded down)`;
+        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney((lines[i].unitPrice || 0) / 2)}/500g, rounded down)`;
       }
       updateTotal();
     }));
@@ -1828,7 +1831,7 @@ function openOrderOptions(o) {
       <div class="form-card">
         ${weightItems.map(x => `
           <label class="field">
-            <span>${esc(x.item.name)} — actual weight (g), was ${fmtGrams(x.item.qty)} at ${fmtMoney(x.item.unitPrice)}/kg</span>
+            <span>${esc(x.item.name)} — actual weight (g), was ${fmtGrams(x.item.qty)} at ${fmtMoney(x.item.unitPrice / 2)}/500g</span>
             <input type="number" min="1" inputmode="numeric" data-widx="${x.idx}" value="${x.item.qty}">
           </label>`).join('')}
         <button class="btn-filled" id="owSave">Save weights</button>
@@ -1914,10 +1917,10 @@ async function openOrderForm() {
       <div class="line-item" style="margin-bottom:2px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Weight (g)</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
-        <label class="field"><span>฿ / kg</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="1" inputmode="numeric" value="${l.unitPrice}"></label>
+        <label class="field"><span>฿ / 500g</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${l.unitPrice / 2}"></label>
         <button class="remove" data-rm="${i}" title="Remove item">✕</button>
       </div>
-      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney(l.unitPrice || 0)}/kg, rounded down)</div>` : `
+      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney((l.unitPrice || 0) / 2)}/500g, rounded down)</div>` : `
       <div class="line-item" style="margin-bottom:10px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Qty</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
@@ -1927,7 +1930,7 @@ async function openOrderForm() {
 
     linesEl.querySelectorAll('[data-li]').forEach(el => el.addEventListener('input', () => {
       const i = Number(el.dataset.li), k = el.dataset.k;
-      lines[i][k] = Number(el.value);
+      lines[i][k] = (k === 'unitPrice' && lines[i].weightBased) ? Number(el.value) * 2 : Number(el.value);
       if (k === 'productId') {           // product switched: refill price/qty/type from the product card
         const p = products.find(p => p.id === lines[i].productId);
         lines[i] = newLine(p);
@@ -1935,7 +1938,7 @@ async function openOrderForm() {
       } else if (lines[i].weightBased) {
         // live-update the computed line price under the row
         const hint = el.closest('.line-item').nextElementSibling;
-        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney(lines[i].unitPrice || 0)}/kg, rounded down)`;
+        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney((lines[i].unitPrice || 0) / 2)}/500g, rounded down)`;
       }
       updateTotal();
     }));
@@ -2242,7 +2245,7 @@ async function seedSampleData() {
   await DB.add('orders', {
     customerId: c1, customerName: 'Maren Holt', address: '14 Birch Lane, Riverton',
     items: [{ productId: pids[0], name: 'Oak shelf 80 cm', qty: 2, unitPrice: 89 }],
-    total: 178, status: 'Completed', createdAt: Date.now() - day * 12, statusChangedAt: Date.now() - day * 8
+    total: 178, status: 'Shipped', createdAt: Date.now() - day * 12, statusChangedAt: Date.now() - day * 8
   });
   await DB.add('orders', {
     customerId: c2, customerName: 'Tobias Lind', address: '3 Harbor St, Eastport',
@@ -2283,4 +2286,24 @@ if ('serviceWorker' in navigator) {
 }
 
 /* ---------------- Boot ---------------- */
-Promise.all([ensureDeliveryProduct(), ensureOrderSeq()]).then(() => switchView('home'));
+/* One-off data migrations, safe to run repeatedly. */
+async function ensureMigrations() {
+  // Status rename: Completed -> Shipped (idempotent)
+  const orders = await DB.getAll('orders');
+  for (const o of orders) {
+    if (o.status === 'Completed') { o.status = 'Shipped'; await DB.put('orders', o); }
+  }
+  // Weight pack size: old default 1000g becomes the new 500g default (once)
+  if (!localStorage.getItem('erp_pack500')) {
+    const products = await DB.getAll('products');
+    for (const p of products) {
+      if (p.unit === 'weight' && (!p.packG || p.packG === 1000)) {
+        p.packG = 500;
+        await DB.put('products', p);
+      }
+    }
+    localStorage.setItem('erp_pack500', '1');
+  }
+}
+
+Promise.all([ensureDeliveryProduct(), ensureOrderSeq(), ensureMigrations()]).then(() => switchView('home'));
