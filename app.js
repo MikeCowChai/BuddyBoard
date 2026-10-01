@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.10.0';
+const BUILD = '2.10.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -993,7 +993,10 @@ async function saveFile(name, blob, what = 'File') {
    reserve % → remainder split between two shares. All percentages and the
    base are configurable and stored locally. Amounts always sum exactly:
    each step rounds the set-aside and keeps the remainder intact. */
-const SPLIT_DEFAULTS = { base: 'profit', taxPct: 7, resPct: 2.5, sharePct: 60, name1: 'Share 1', name2: 'Share 2' };
+// taxStays: the tax reserve simply stays in the company account, so it
+// never needs to be marked as set aside.
+const SPLIT_DEFAULTS = { base: 'profit', taxPct: 7, resPct: 2.5, sharePct: 60, name1: 'Share 1', name2: 'Share 2', taxStays: true };
+const taxStays = () => splitCfg().taxStays !== false;
 function splitCfg() {
   try { return { ...SPLIT_DEFAULTS, ...JSON.parse(shared.getItem('erp_split_cfg') || '{}') }; }
   catch { return { ...SPLIT_DEFAULTS }; }
@@ -1121,7 +1124,7 @@ async function openSettleSheet() {
       opt('stlShare1', `${esc(payoutLabel('share1'))}'s share paid`, sum(perKind.share1), undefined, true) +
       opt('stlShare2', `${esc(payoutLabel('share2'))}'s share paid`, sum(perKind.share2), undefined, true) +
       opt('stlBuffer', 'Buffer set aside', sum(perKind.buffer), undefined, false) +
-      opt('stlTax', 'Tax reserve set aside', sum(perKind.tax), undefined, false) +
+      (taxStays() ? '' : opt('stlTax', 'Tax reserve set aside', sum(perKind.tax), undefined, false)) +
       (marked.length ? `
       <label class="field-checkbox stl-marked"><input type="checkbox" id="stlMarked" checked>
         <span><b>Already marked in the app, but done before</b> — ${marked.length} item${marked.length === 1 ? '' : 's'}, ${fmtMoney(sum(marked))}. Keeps them as paid, but takes them out of the bank movements (they were not paid from the bank on the day you tapped).</span></label>` : '');
@@ -1131,7 +1134,7 @@ async function openSettleSheet() {
   $('#stlSave').onclick = () => {
     const idx = Number($('#stlMonth').value);
     const { fronted, perKind, marked } = plan(idx);
-    const picked = { fronted: $('#stlFronted').checked, share1: $('#stlShare1').checked, share2: $('#stlShare2').checked, buffer: $('#stlBuffer').checked, tax: $('#stlTax').checked, marked: !!($('#stlMarked') && $('#stlMarked').checked) };
+    const picked = { fronted: $('#stlFronted').checked, share1: $('#stlShare1').checked, share2: $('#stlShare2').checked, buffer: $('#stlBuffer').checked, tax: !!($('#stlTax') && $('#stlTax').checked), marked: !!($('#stlMarked') && $('#stlMarked').checked) };
     if (!Object.values(picked).some(Boolean)) return snack('Tick at least one item');
     showConfirm(`Mark the ticked items as settled up to and including ${months[idx].label}? The bank balance stays the same.`, async () => {
       const now = Date.now();
@@ -1196,6 +1199,7 @@ async function renderSplit() {
   const inPeriod = x => !x.withdrawal && x.periodStart >= per.start && x.periodEnd <= per.end;
   const paidHere = Object.fromEntries(PAYOUT_KINDS.map(k => [k, payouts.filter(x => x.kind === k && inPeriod(x))]));
   const status = kind => {
+    if (kind === 'tax' && taxStays()) return due.tax > 0 ? '<span class="pay-status is-done">✓ Stays in the account</span>' : '';
     const list = paidHere[kind], paid = list.reduce((t, x) => t + x.amount, 0), left = due[kind] - paid;
     const done = isShareKind(kind) ? 'Paid' : 'Set aside';
     if (due[kind] <= 0 && !paid) return '';
@@ -1287,8 +1291,9 @@ async function renderSplit() {
       </div>
       <div class="tot-row">
         <span class="tot-name">Tax reserve</span>
-        <span class="tot-main">${fmtMoney(tot.tax)} <small>set aside</small></span>
-        <span class="tot-open ${openAmt('tax') ? 'is-open' : ''}">${openAmt('tax') ? fmtMoney(openAmt('tax')) + ' still to set aside' : 'all set aside'}</span>
+        ${taxStays() ? `<span class="tot-main">${fmtMoney(allDue.tax)} <small>reserved</small></span>
+        <span class="tot-open">stays in the company account</span>` : `<span class="tot-main">${fmtMoney(tot.tax)} <small>set aside</small></span>
+        <span class="tot-open ${openAmt('tax') ? 'is-open' : ''}">${openAmt('tax') ? fmtMoney(openAmt('tax')) + ' still to set aside' : 'all set aside'}</span>`}
       </div>
       ${isAdmin() ? `<button class="btn-tonal" id="bufferTake" ${inBuffer > 0 ? '' : 'disabled'}>Take from buffer…</button>` : ''}
       <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);margin-top:8px">“Still to pay” adds up every month's split up to today. Paid-out shares come off the bank balance; tax and buffer stay company money.</div>
@@ -1361,6 +1366,8 @@ function openSplitSettings() {
       <label class="field"><span>First share (%) — the rest goes to the second share</span>
         <input id="spShare" type="number" min="0" max="100" step="0.5" inputmode="decimal" value="${cfg.sharePct}">
       </label>
+      <label class="field-checkbox"><input type="checkbox" id="spTaxStays" ${cfg.taxStays !== false ? 'checked' : ''}>
+        <span>Tax reserve stays in the company account — no need to mark it as set aside</span></label>
       <div class="field-row">
         <label class="field"><span>Name first share</span><input id="spName1" value="${esc(cfg.name1)}"></label>
         <label class="field"><span>Name second share</span><input id="spName2" value="${esc(cfg.name2)}"></label>
@@ -1394,6 +1401,7 @@ function openSplitSettings() {
       ...next,
       name1: $('#spName1').value.trim() || 'Share 1',
       name2: $('#spName2').value.trim() || 'Share 2',
+      taxStays: $('#spTaxStays').checked,
       previous
     }));
     closeSheet(); snack(changed ? 'New percentages apply from now on' : 'Split settings saved'); render();
