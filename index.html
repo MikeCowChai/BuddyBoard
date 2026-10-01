@@ -16,6 +16,7 @@
 <header class="top-bar">
   <h1 id="viewTitle">Dashboard</h1>
   <div class="top-bar-end">
+    <span class="sync-state" id="syncState" hidden title="No connection — changes are saved on this device and sync when you're back online">Offline</span>
     <span class="top-bar-meta" id="topBarMeta"></span>
     <button class="icon-btn" id="themeBtn" title="Settings">
       <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.5 7.5 0 0 0 .05-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.55-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.31 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.5 7.5 0 0 0 .05 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.42.34.61.22l2.39-.96c.5.39 1.03.7 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.59-.24 1.13-.55 1.62-.94l2.39.96c.19.12.47.02.61-.22l1.92-3.32a.5.5 0 0 0-.12-.64zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7"/></svg>
@@ -24,28 +25,53 @@
 </header>
 
 <main id="main">
-  <!-- Dashboard -->
-  <section class="view" id="view-dashboard" hidden></section>
+  <!-- Home (slim: current status only) -->
+  <section class="view" id="view-home" hidden></section>
 
-  <!-- Inventory -->
-  <section class="view" id="view-inventory" hidden>
+  <!-- Orders -->
+  <section class="view" id="view-orders" hidden>
+    <div class="search-field">
+      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14"/></svg>
+      <input type="search" id="orderSearch" placeholder="Search orders or customers" autocomplete="off">
+    </div>
+    <div class="chip-row" id="statusChips">
+      <button class="chip is-selected" data-status="open">Open</button>
+      <button class="chip" data-status="all">All</button>
+      <button class="chip" data-status="In production">In production</button>
+      <button class="chip" data-status="Ready for shipping">Ready for shipping</button>
+      <button class="chip" data-status="Shipped">Shipped</button>
+      <button class="chip" data-status="Delivered">Delivered</button>
+    </div>
+    <div id="orderList" class="card-list"></div>
+  </section>
+
+  <!-- Stock (products only) -->
+  <section class="view" id="view-stock" hidden>
+    <div class="search-field">
+      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14"/></svg>
+      <input type="search" id="productSearch" placeholder="Search products" autocomplete="off">
+    </div>
+    <div class="chip-row" id="stockChips">
+      <button class="chip is-selected" data-stockfilter="all">All</button>
+      <button class="chip" data-stockfilter="low">Low stock</button>
+      <button class="chip" data-stockfilter="out">Out of stock</button>
+    </div>
+    <div id="stockOutlook"></div>
+    <div id="productList" class="card-list"></div>
+  </section>
+
+  <!-- Money (Expenses + financial reports + profit split) -->
+  <section class="view" id="view-money" hidden>
     <div class="seg-tabs" role="tablist">
-      <button class="seg-tab is-active" data-invtab="stock" role="tab">Stock</button>
-      <button class="seg-tab" data-invtab="purchases" role="tab">Expenses</button>
+      <button class="seg-tab is-active" data-moneytab="reports" role="tab">Reports</button>
+      <button class="seg-tab" data-moneytab="bank" role="tab">Bank</button>
+      <button class="seg-tab" data-moneytab="split" role="tab">Split</button>
+      <button class="seg-tab" data-moneytab="expenses" role="tab">Expenses</button>
     </div>
-    <div id="inv-stock">
-      <div class="search-field">
-        <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14"/></svg>
-        <input type="search" id="productSearch" placeholder="Search products" autocomplete="off">
-      </div>
-      <div class="chip-row" id="stockChips">
-        <button class="chip is-selected" data-stockfilter="all">All</button>
-        <button class="chip" data-stockfilter="low">Low stock</button>
-        <button class="chip" data-stockfilter="out">Out of stock</button>
-      </div>
-      <div id="productList" class="card-list"></div>
-    </div>
-    <div id="inv-purchases" hidden>
+    <div id="money-reports"></div>
+    <div id="money-bank" hidden></div>
+    <div id="money-split" hidden></div>
+    <div id="money-expenses" hidden>
       <div class="card form-card">
         <h2 class="card-title">Log an expense</h2>
         <label class="field">
@@ -74,15 +100,25 @@
             <input type="date" id="poDate">
           </label>
           <label class="field">
-            <span>Supplier (optional)</span>
-            <input type="text" id="poSupplier" placeholder="e.g. Northline Supply">
+            <span>Paid by</span>
+            <select id="poPaidBy">
+              <option value="company">Company</option>
+              <option value="p1">Person 1</option>
+              <option value="p2">Person 2</option>
+            </select>
           </label>
         </div>
+        <label class="field">
+          <span>Supplier (optional)</span>
+          <input type="text" id="poSupplier" placeholder="e.g. Northline Supply">
+        </label>
         <button class="btn-filled" id="poReceive">Log expense</button>
       </div>
+      <div id="owedCard"></div>
       <h2 class="section-label">Recent expenses</h2>
       <div class="chip-row" id="purchaseChips">
         <button class="chip is-selected" data-pcat="all">All</button>
+        <button class="chip" data-pcat="__owed">Not reimbursed</button>
         <button class="chip" data-pcat="Materials">Materials</button>
         <button class="chip" data-pcat="Packaging">Packaging</button>
         <button class="chip" data-pcat="Equipment">Equipment</button>
@@ -91,23 +127,6 @@
       </div>
       <div id="purchaseList" class="card-list"></div>
     </div>
-  </section>
-
-  <!-- Orders -->
-  <section class="view" id="view-orders" hidden>
-    <div class="search-field">
-      <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14"/></svg>
-      <input type="search" id="orderSearch" placeholder="Search orders or customers" autocomplete="off">
-    </div>
-    <div class="chip-row" id="statusChips">
-      <button class="chip is-selected" data-status="open">Open</button>
-      <button class="chip" data-status="all">All</button>
-      <button class="chip" data-status="In production">In production</button>
-      <button class="chip" data-status="Ready for shipping">Ready for shipping</button>
-      <button class="chip" data-status="Completed">Completed</button>
-      <button class="chip" data-status="Delivered">Delivered</button>
-    </div>
-    <div id="orderList" class="card-list"></div>
   </section>
 
   <!-- Customers -->
@@ -127,17 +146,21 @@
 </button>
 
 <nav class="nav-bar">
-  <button class="nav-item is-active" data-view="dashboard">
-    <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 13h8V3H3zm0 8h8v-6H3zm10 0h8V11h-8zm0-18v6h8V3z"/></svg></span>
-    <span>Dashboard</span>
-  </button>
-  <button class="nav-item" data-view="inventory">
-    <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20 2H4c-1 0-2 .9-2 2v3.01c0 .72.43 1.34 1 1.69V20c0 1.1 1.1 2 2 2h14c.9 0 2-.9 2-2V8.7c.57-.35 1-.97 1-1.69V4c0-1.1-1-2-2-2m-5 12H9v-2h6zm5-7H4V4h16z"/></svg></span>
-    <span>Inventory</span>
+  <button class="nav-item is-active" data-view="home">
+    <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></span>
+    <span>Home</span>
   </button>
   <button class="nav-item" data-view="orders">
     <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1s-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2m-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1m2 14H7v-2h7zm3-4H7v-2h10zm0-4H7V7h10z"/></svg></span>
     <span>Orders</span>
+  </button>
+  <button class="nav-item" data-view="stock">
+    <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20 2H4c-1 0-2 .9-2 2v3.01c0 .72.43 1.34 1 1.69V20c0 1.1 1.1 2 2 2h14c.9 0 2-.9 2-2V8.7c.57-.35 1-.97 1-1.69V4c0-1.1-1-2-2-2m-5 12H9v-2h6zm5-7H4V4h16z"/></svg></span>
+    <span>Stock</span>
+  </button>
+  <button class="nav-item" data-view="money">
+    <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M11.8 10.9c-2.27-.59-3-1.2-3-2.15 0-1.09 1.01-1.85 2.7-1.85 1.78 0 2.44.85 2.5 2.1h2.21c-.07-1.72-1.12-3.3-3.21-3.81V3h-3v2.16c-1.94.42-3.5 1.68-3.5 3.61 0 2.31 1.91 3.46 4.7 4.13 2.5.6 3 1.48 3 2.41 0 .69-.49 1.79-2.7 1.79-2.06 0-2.87-.92-2.98-2.1H6.32c.12 2.19 1.76 3.42 3.68 3.83V21h3v-2.15c1.95-.37 3.5-1.5 3.5-3.55 0-2.84-2.43-3.81-4.7-4.4"/></svg></span>
+    <span>Money</span>
   </button>
   <button class="nav-item" data-view="customers">
     <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3m-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3m0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5m8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5"/></svg></span>
@@ -148,7 +171,8 @@
 <!-- Sheet (modal) for forms & details -->
 <div class="scrim" id="scrim" hidden></div>
 <div class="sheet" id="sheet" hidden>
-  <div class="sheet-handle"></div>
+  <div class="sheet-handle" id="sheetHandle"></div>
+  <button class="sheet-close" id="sheetClose" title="Close">✕</button>
   <div class="sheet-content" id="sheetContent"></div>
 </div>
 
@@ -164,7 +188,15 @@
   </div>
 </div>
 
+<!-- Sign-in / loading screen (covers the app until data is ready) -->
+<div class="login" id="login"></div>
+
+<script src="vendor/firebase-app-compat.js"></script>
+<script src="vendor/firebase-auth-compat.js"></script>
+<script src="vendor/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
 <script src="db.js"></script>
+<script src="cloud.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

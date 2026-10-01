@@ -302,6 +302,8 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 .stat-card.hero .value { font-size: 38px; }
 .stat-card .hint { font-size: 12px; opacity: .7; margin-top: 2px; }
 .stat-card.warn { background: var(--md-tertiary-container); color: var(--md-on-tertiary-container); }
+.stat-card.tappable { cursor: pointer; }
+.stat-card.tappable:active { filter: brightness(0.97); }
 
 .activity-item { display: flex; gap: 12px; padding: 11px 4px; border-bottom: 1px solid var(--md-outline-variant); }
 .activity-item:last-child { border-bottom: 0; }
@@ -365,7 +367,7 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 }
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
-  max-height: 88vh; max-height: 88dvh; overflow-y: auto;
+  max-height: 85vh; max-height: 85dvh; overflow-y: auto;
   overscroll-behavior: contain;
   background: var(--md-surface-container-low);
   border-radius: 24px 24px 0 0;
@@ -382,6 +384,16 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 .sheet-handle::before {
   content: ''; position: absolute; inset: -18px -60px;
 }
+.sheet-close {
+  position: sticky; top: 0; float: right;
+  width: 36px; height: 36px; margin: -30px -4px 0 0;
+  border-radius: var(--radius-full);
+  display: grid; place-items: center;
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  font-size: 15px; z-index: 5;
+}
+.sheet-close:active { background: var(--md-outline-variant); }
 .sheet h2 { font-size: 20px; margin-bottom: 16px; }
 @keyframes rise { from { transform: translateY(40%); opacity: .4; } }
 @keyframes fade { from { opacity: 0; } }
@@ -401,6 +413,64 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 }
 .dialog-text { font-size: 15px; margin-bottom: 18px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 4px; }
+
+/* ---------- Compact customer picker dropdown ---------- */
+.combo-drop {
+  position: absolute; left: 0; right: 0; top: 100%; z-index: 60;
+  margin-top: 4px;
+  background: var(--md-surface-container-high);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--radius-m);
+  box-shadow: 0 6px 20px rgba(0,0,0,.18);
+  max-height: 218px; overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.combo-item {
+  padding: 11px 14px;
+  font-size: 15px;
+  border-bottom: 1px solid var(--md-outline-variant);
+  cursor: pointer;
+}
+.combo-item:last-child { border-bottom: 0; }
+.combo-item:active { background: var(--md-surface-container-highest); }
+.combo-item .sub { font-size: 12px; color: var(--md-on-surface-variant); margin-top: 1px; }
+.combo-new { color: var(--md-primary); font-weight: 600; }
+.combo-notice {
+  font-size: 13px; font-weight: 600; color: var(--md-primary);
+  margin: -2px 0 8px; padding: 0 2px;
+}
+
+/* ---------- Settings rows ---------- */
+.set-card { padding: 4px 16px; }
+.set-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; text-align: left;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--md-outline-variant);
+}
+.set-card .set-row:last-of-type { border-bottom: 0; }
+.set-row:active { background: var(--md-surface-container-high); }
+.set-main { min-width: 0; }
+.set-title { font-weight: 500; font-size: 15px; }
+.set-sub { font-size: 12.5px; color: var(--md-on-surface-variant); margin-top: 2px; }
+.set-chevron { flex: none; font-size: 20px; color: var(--md-outline); }
+
+/* ---------- Profit split waterfall ---------- */
+.flow-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 9px 4px; font-size: 14.5px;
+}
+.flow-row.start { font-weight: 700; font-size: 16px; }
+.flow-row.minus { color: var(--md-tertiary); }
+.flow-row.sub {
+  border-top: 1px solid var(--md-outline-variant);
+  font-weight: 600;
+}
+.flow-row.share {
+  background: var(--md-primary-container); color: var(--md-on-primary-container);
+  border-radius: var(--radius-s); padding: 11px 12px; margin-top: 6px;
+  font-weight: 600;
+}
 
 /* ---------- Revenue chart ---------- */
 .chart { display: flex; align-items: flex-end; gap: 8px; height: 150px; padding-top: 8px; }
@@ -471,3 +541,22 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 button:focus-visible, input:focus-visible, select:focus-visible {
   outline: 2px solid var(--md-primary); outline-offset: 2px;
 }
+
+/* ---- Cloud sync: sign-in screen + offline badge ---- */
+.login {
+  position: fixed; inset: 0; z-index: 900;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px 16px; background: var(--md-surface); overflow-y: auto;
+}
+.login[hidden] { display: none; }
+.login-card { width: 100%; max-width: 360px; text-align: center; }
+.login-card .form-card { text-align: left; margin-top: 20px; }
+.login-logo { width: 64px; height: 64px; border-radius: var(--radius-l); }
+.login-card h2 { margin: 12px 0 4px; color: var(--md-on-surface); }
+.login-sub { margin: 0; font-size: 14px; color: var(--md-on-surface-variant); line-height: 1.45; }
+.login-error { min-height: 18px; font-size: 13px; color: var(--md-error); }
+.sync-state {
+  font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: var(--radius-full);
+  background: var(--md-tertiary-container); color: var(--md-on-tertiary-container);
+}
+.sync-state[hidden] { display: none; }
