@@ -1,40 +1,49 @@
 # BuddyBoard: synchronisatie instellen (eenmalig, ±10 minuten)
 
-Vanaf versie 2.0.0 staan alle gegevens in een gedeelde online database (Firebase van Google).
-Elke telefoon of computer die inlogt ziet dezelfde gegevens, live. Zonder internet blijft de
-app gewoon werken; wijzigingen worden gesynchroniseerd zodra er weer verbinding is.
+Vanaf versie 2.0.0 staan alle gegevens in een gedeelde online database ([Supabase](https://supabase.com),
+open source). Elke telefoon of computer die inlogt ziet dezelfde gegevens, live. Zonder internet
+blijft de app gewoon werken; wijzigingen worden bewaard en verstuurd zodra er weer verbinding is.
 
-## 1. Firebase-project aanmaken
-1. Ga naar <https://console.firebase.google.com> en log in met je Google-account.
-2. **Create a project** → naam bijv. `buddyboard` → Google Analytics mag uit → **Create**.
+## 1. Supabase-project aanmaken
+1. Ga naar <https://supabase.com> → **Start your project** → **Continue with GitHub**.
+2. **New project** → naam bijv. `buddyboard`, kies een sterk database-wachtwoord (bewaar het),
+   regio dichtbij (bijv. *Southeast Asia (Singapore)*) → **Create new project**. Wacht tot hij klaar is.
 
-## 2. Database aanzetten
-1. Links in het menu: **Build → Firestore Database** → **Create database**.
-2. Kies een locatie dichtbij (bijv. `asia-southeast1` voor Thailand/Singapore) — dit kan later niet meer veranderd worden.
-3. Kies **Start in production mode** → **Create**.
-4. Open het tabblad **Rules**, vervang alles door de inhoud van [`firestore.rules`](firestore.rules)
-   en vul daarin **jullie twee e-mailadressen** in (kleine letters). Klik **Publish**.
+## 2. Database klaarzetten
+1. Links in het menu: **SQL Editor** → **New query**.
+2. Plak de volledige inhoud van [`supabase/schema.sql`](supabase/schema.sql).
+3. Pas **helemaal onderaan** de twee e-mailadressen aan naar die van jou en je compagnon.
+4. Klik **Run**. (Je mag dit later opnieuw draaien, bijv. om iemand toe te voegen.)
 
-## 3. Inloggen aanzetten en accounts maken
-1. **Build → Authentication** → **Get started** → **Email/Password** → aanzetten → **Save**.
-2. Tabblad **Users** → **Add user** → jouw e-mail + wachtwoord. Doe hetzelfde voor je compagnon.
-   (Gebruik precies dezelfde e-mailadressen als in de rules van stap 2.)
+## 3. Accounts maken
+1. **Authentication → Users → Add user → Create new user**.
+2. Vul jouw e-mail + een wachtwoord in, vink **Auto Confirm User** aan → **Create user**.
+   Doe hetzelfde voor je compagnon. (Precies dezelfde e-mailadressen als in stap 2.)
+3. Aanrader: **Authentication → Sign In / Providers** → zet **Allow new users to sign up** uit,
+   zodat niemand anders een account kan maken. (Ook mét account komt alleen wie in de teamlijst
+   staat bij de gegevens.)
 
 ## 4. App koppelen
-1. Tandwiel (⚙) linksboven → **Project settings** → onderaan bij *Your apps* het **`</>`** (Web) icoon.
-2. Naam bijv. `buddyboard-web` → **Register app** (Firebase Hosting hoeft niet).
-3. Je ziet een stukje code met `const firebaseConfig = { apiKey: "...", ... }`.
-   Zet die waarden in [`firebase-config.js`](firebase-config.js) — of stuur ze naar Claude, dan doet die het.
-   (Deze waarden zijn niet geheim; de beveiliging zit in het inloggen + de rules.)
+1. **Project Settings → API** (of de knop **Connect** bovenaan).
+2. Kopieer de **Project URL** en de **anon / publishable key**.
+3. Zet die in [`supabase-config.js`](supabase-config.js) — of stuur ze naar Claude, dan doet die het.
+   Deze twee zijn bedoeld om openbaar te zijn. Gebruik **nooit** de `service_role`/secret key.
 
 ## 5. Gegevens overzetten
-1. Open BuddyBoard op de telefoon waar je huidige gegevens op staan, via het **nieuwe adres** (zonder `/v2/`).
-   Het oude `/v2/`-adres stuurt automatisch door.
+1. Open BuddyBoard op de telefoon waar je huidige gegevens op staan via het nieuwe adres
+   `https://mikecowchai.github.io/BuddyBoard/` (het oude `/v2/`-adres stuurt automatisch door).
 2. Log in. De app vraagt: *"This device still has its own data … Upload it?"* → **Upload**.
-3. Klaar. Log op de andere telefoon(s) en op de computer in — alles staat er.
+3. Log op de andere telefoon(s) en de computer in — alles staat er.
+4. Verwijder het oude BuddyBoard-icoon van je homescreen en zet de app opnieuw op je homescreen
+   vanaf het nieuwe adres (Chrome-menu ⋮ → *Toevoegen aan startscherm* / *App installeren*).
 
-Lukt het overzetten niet automatisch? Maak dan in de oude versie een backup (*Settings → Export all data*)
-en zet die in de nieuwe versie terug via *Settings → Import backup…*.
+Lukt het overzetten niet automatisch? Zet dan je backup terug via *Settings → Import backup…*.
+
+## Goed om te weten
+- **Pauze bij niet-gebruik:** een gratis Supabase-project wordt gepauzeerd als het een week niet
+  gebruikt is. Je gegevens blijven bewaard; in het Supabase-dashboard klik je op **Restore project**.
+- **Uitloggen** (Settings → Sign out) wist de kopie op dat apparaat; na opnieuw inloggen komt alles terug.
+- **Backup:** *Settings → Export all data* blijft werken — handig om af en toe te doen.
 
 ## Versienummers
 `MAJOR.MINOR.PATCH`, te zien onderaan in *Settings*:

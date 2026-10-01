@@ -1,13 +1,15 @@
 /* ============================================================
-   cloud.js — Firebase sign-in + start-up of the shared database
-   Cloud.ready resolves once someone is signed in and all data has been
-   loaded; app.js waits for it before rendering anything.
+   cloud.js — Supabase sign-in + start-up of the synced database
+   Cloud.ready resolves once someone is signed in and the data is loaded;
+   app.js waits for it before rendering anything. After the first sign-in
+   the app also opens offline, from the copy stored on the device.
    ============================================================ */
 const Cloud = (() => {
-  const cfg = window.FIREBASE_CONFIG || {};
-  let auth = null;
+  const cfg = window.SUPABASE_CONFIG || {};
+  let sb = null;
   let resolveReady;
   const ready = new Promise(r => { resolveReady = r; });
+  const USER_KEY = 'bb_user';
 
   const gate = () => document.getElementById('login');
   function showGate(html) {
@@ -26,23 +28,80 @@ const Cloud = (() => {
         <label class="field"><span>Password</span>
           <input type="password" id="loginPass" autocomplete="current-password" required>
         </label>
-        <div class="login-error" id="loginError">${msg}</div>
+        <div class="login-error" id="loginError">${esc(msg)}</div>
         <button class="btn-filled" type="submit" id="loginBtn">Sign in</button>
       </form>`);
     document.getElementById('loginForm').onsubmit = async e => {
       e.preventDefault();
       const btn = document.getElementById('loginBtn');
+      const errEl = document.getElementById('loginError');
       btn.disabled = true;
-      try {
-        await auth.signInWithEmailAndPassword(
-          document.getElementById('loginEmail').value.trim(),
-          document.getElementById('loginPass').value);
-      } catch (err) {
-        document.getElementById('loginError').textContent =
-          /invalid|wrong|not-found|user/.test(err.code || '') ? 'Wrong email or password.' : (err.message || String(err));
+      errEl.textContent = '';
+      const { data, error } = await sb.auth.signInWithPassword({
+        email: document.getElementById('loginEmail').value.trim(),
+        password: document.getElementById('loginPass').value
+      });
+      if (error) {
+        errEl.textContent = /invalid/i.test(error.message) ? 'Wrong email or password.'
+          : (!navigator.onLine ? 'No internet connection — the first sign-in needs internet.' : error.message);
         btn.disabled = false;
+        return;
       }
+      await afterSignIn(data.user.email, true);
     };
+  }
+
+  /* Checks the account is on the team (supabase/schema.sql → team). */
+  async function checkTeam() {
+    const { data, error } = await sb.rpc('is_team');
+    if (error) throw error;
+    return data === true;
+  }
+
+  async function afterSignIn(email, fresh) {
+    if (fresh) {
+      showGate('<p class="login-sub">Loading…</p>');
+      let ok;
+      try { ok = await checkTeam(); } catch (err) {
+        showLogin('Could not reach the server: ' + (err.message || err));
+        return;
+      }
+      if (!ok) {
+        await sb.auth.signOut();
+        showLogin(`${email} has no access to this BuddyBoard. Add it to the team list in Supabase (see SETUP.md).`);
+        return;
+      }
+      if (localStorage.getItem(USER_KEY) !== email) await DB.wipeLocal(); // another account's copy
+      localStorage.setItem(USER_KEY, email);
+      await DB.connect(sb, { onError: syncError });
+    } else {
+      // Signed in before: open straight from the device copy, sync in the background.
+      resumeSession(email);
+    }
+    gate().hidden = true;
+    watchStatus();
+    await offerLocalUpload();
+    resolveReady();
+  }
+
+  /* Reconnect the stored session; offline, try again once back online. */
+  async function resumeSession(email) {
+    const { data } = await sb.auth.getSession().catch(() => ({ data: {} }));
+    if (data && data.session) return DB.connect(sb, { onError: syncError });
+    if (!navigator.onLine) {
+      window.addEventListener('online', () => resumeSession(email), { once: true });
+      return;
+    }
+    showLogin(`Please sign in again (${email}).`);
+  }
+
+  function syncError(err) {
+    const msg = String(err.message || err);
+    if (err.code === '42501' || /JWT|not on the BuddyBoard team|permission/i.test(msg)) {
+      snack('Sync refused — sign out and sign in again, or check the team list in Supabase');
+    } else {
+      snack('Sync problem: ' + msg);
+    }
   }
 
   /* ---- One-time move of data that lived only on this device ----
@@ -83,10 +142,10 @@ const Cloud = (() => {
         `This device still has its own data (${local.orders.length} orders, ${local.products.length} products, ${local.customers.length} customers). Upload it to the shared BuddyBoard so every device sees it?`,
         async () => {
           await DB.importAll({ app: 'buddyboard', ...local });
-          LEGACY_SETTINGS.forEach(k => {
+          for (const k of LEGACY_SETTINGS) {
             const v = localStorage.getItem(k);
-            if (v != null) DB.setSetting(k, v);
-          });
+            if (v != null) await DB.setSetting(k, v);
+          }
           localStorage.setItem('bb_local_upload_done', '1');
           snack('Data uploaded — it now syncs to every device');
           done();
@@ -99,64 +158,62 @@ const Cloud = (() => {
     });
   }
 
-  /* ---- Offline indicator in the top bar ---- */
-  function watchConnection() {
+  /* ---- "Offline" / "Syncing" badge in the top bar ---- */
+  function watchStatus() {
     const el = document.getElementById('syncState');
-    const upd = () => { el.hidden = navigator.onLine; };
+    const upd = () => {
+      const n = DB.pendingCount();
+      if (!navigator.onLine) {
+        el.textContent = n ? `Offline · ${n} to sync` : 'Offline';
+        el.hidden = false;
+      } else if (n) {
+        el.textContent = 'Syncing…';
+        el.hidden = false;
+      } else el.hidden = true;
+    };
     window.addEventListener('online', upd);
     window.addEventListener('offline', upd);
+    DB.onStatus(upd);
     upd();
   }
 
-  function start() {
-    if (!cfg.apiKey || !cfg.projectId) {
-      showGate(`<p class="login-sub">Cloud sync is not set up yet: fill in <b>firebase-config.js</b> with your Firebase project settings.</p>`);
+  async function start() {
+    if (!cfg.url || !cfg.anonKey) {
+      showGate(`<p class="login-sub">Sync is not set up yet: fill in <b>supabase-config.js</b> with your Supabase project URL and key (see SETUP.md).</p>`);
       return;
     }
-    firebase.initializeApp(cfg);
-    auth = firebase.auth();
-    const db = firebase.firestore();
-    const emu = window.__BB_EMULATOR; // only set by automated tests
-    if (emu) {
-      auth.useEmulator(`http://${emu.host}:${emu.authPort}`, { disableWarnings: true });
-      db.useEmulator(emu.host, emu.firestorePort);
+    sb = supabase.createClient(cfg.url, cfg.anonKey, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
+    });
+    await DB.load();
+    const known = localStorage.getItem(USER_KEY);
+    if (known) {
+      // Don't wait for the network: the stored session is enough to start.
+      afterSignIn(known, false);
+    } else {
+      showLogin();
     }
-    db.settings({ ignoreUndefinedProperties: true, merge: true });
-    // Keep a copy of the data on the device so the app also works offline.
-    const persisted = db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
+  }
 
-    let started = false;
-    auth.onAuthStateChanged(async user => {
-      if (!user) { if (!started) showLogin(); else location.reload(); return; }
-      if (started) return;
-      started = true;
-      showGate('<p class="login-sub">Loading…</p>');
-      try {
-        await persisted;
-        await DB.start(db, {
-          onError: err => snack(err.code === 'permission-denied'
-            ? 'Sync refused: this account has no access (check firestore.rules)'
-            : 'Sync problem: ' + (err.message || err))
-        });
-      } catch (err) {
-        started = false;
-        await auth.signOut();
-        showLogin(err.code === 'permission-denied'
-          ? `${user.email} has no access to this BuddyBoard. Ask to be added to firestore.rules.`
-          : 'Could not load data: ' + (err.message || err));
+  /* Sign out = forget the account AND the data copy on this device. */
+  async function signOut() {
+    if (DB.pendingCount()) {
+      await DB.syncNow();
+      if (DB.pendingCount()) {
+        snack(`${DB.pendingCount()} change(s) not synced yet — connect to the internet first`);
         return;
       }
-      gate().hidden = true;
-      watchConnection();
-      await offerLocalUpload();
-      resolveReady();
-    });
+    }
+    await sb.auth.signOut().catch(() => {});
+    localStorage.removeItem(USER_KEY);
+    await DB.wipeLocal();
+    location.reload();
   }
 
   return {
     ready,
     start,
-    email: () => auth && auth.currentUser ? auth.currentUser.email : '',
-    signOut: () => auth.signOut()
+    email: () => localStorage.getItem(USER_KEY) || '',
+    signOut
   };
 })();

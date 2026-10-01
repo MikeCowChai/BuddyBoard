@@ -1,29 +1,41 @@
 /* ============================================================
-   db.js — shared cloud data layer (Firebase Firestore)
+   db.js — data layer: local copy on this device + sync via Supabase
    Stores: products, customers, orders, purchases (+ shared settings)
 
-   Every device signed in to the same Firebase project sees the same
-   data, live. The app reads from an in-memory copy that Firestore keeps
-   up to date (also offline — Firestore stores it on the device), so
-   reads stay instant. Writes are applied to that copy immediately and
-   synced in the background; while offline they queue on the device and
-   upload once a connection is back.
+   How it works:
+   - Everything is kept in memory and in a local IndexedDB copy, so the
+     app opens and works without a connection.
+   - Every change is applied locally right away and also put in an
+     "outbox" (also stored on the device). The outbox is uploaded to
+     Supabase as soon as there is a connection, one atomic batch at a
+     time (supabase/schema.sql → apply_ops).
+   - Changes from the other devices arrive live (Supabase Realtime) and
+     are also fetched on start, on reconnect and when the app comes back
+     to the foreground, so nothing is missed.
 
    IDs stay numbers (the rest of the app compares ids with Number(...)),
-   but are generated from the clock + a random part so two devices can
-   never hand out the same id.
+   generated from the clock + a random part so two devices never hand
+   out the same id.
    ============================================================ */
 const DB = (() => {
   const STORES = ['products', 'customers', 'orders', 'purchases'];
   const cache = Object.fromEntries(STORES.map(s => [s, new Map()]));
   let settings = {};
-  let fs = null;
+  let outbox = [];                 // [{ seq, op }] in upload order
+  const pending = new Map();       // "store/key" -> number of queued ops
+  let sb = null;                   // Supabase client (null until signed in)
+  let idbp = null;
+  let lastSync = null;             // newest server updated_at seen
+  let flushing = false, flushTimer = null, pullTimer = null, channel = null;
   const changeListeners = new Set();
-  let onWriteError = err => console.error(err);
+  const statusListeners = new Set();
+  let onSyncError = err => console.error(err);
 
   const clone = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
-  const ref = (store, id) => fs.collection(store).doc(String(id));
-  const settingsRef = () => fs.collection('meta').doc('settings');
+  const pkey = (store, key) => store + '/' + key;
+  const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+    : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c =>
+        (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)));
 
   function genId() {
     let id;
@@ -32,104 +44,273 @@ const DB = (() => {
     return id;
   }
 
-  /* Apply a list of writes: first to the local copy (so the very next read
-     sees them), then to Firestore as one atomic batch. The batch is NOT
-     awaited — offline it only resolves once back online, and the app must
-     not hang until then. Firestore keeps queued writes across restarts.
-     ops: { set: [store, obj] } | { del: [store, id] } | { stock: [id, delta] }
-          | { setting: [key, value|undefined] } */
-  function commit(ops) {
-    const FV = firebase.firestore.FieldValue;
-    const writes = [];
+  /* ---------------- Local copy (IndexedDB) ---------------- */
+  function idb() {
+    if (idbp) return idbp;
+    idbp = new Promise((resolve, reject) => {
+      const req = indexedDB.open('buddyboard-sync', 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        db.createObjectStore('records', { keyPath: ['store', 'key'] });
+        db.createObjectStore('outbox', { keyPath: 'seq', autoIncrement: true });
+        db.createObjectStore('meta');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return idbp;
+  }
+  async function idbTx(stores, fn) {
+    const db = await idb();
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(stores, 'readwrite');
+      const out = fn(t);
+      t.oncomplete = () => resolve(out);
+      t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error || new Error('Local save aborted'));
+    });
+  }
+  const getAllFrom = (t, s) => new Promise(r => { t.objectStore(s).getAll().onsuccess = e => r(e.target.result); });
+
+  function setLocal(store, key, data) {
+    if (store === 'settings') {
+      if (data === null || data === undefined) delete settings[key]; else settings[key] = data;
+    } else if (data === null || data === undefined) cache[store].delete(Number(key));
+    else cache[store].set(Number(key), data);
+  }
+  function getLocal(store, key) {
+    return store === 'settings' ? settings[key] : cache[store].get(Number(key));
+  }
+
+  /* ---------------- Writing ---------------- */
+  /* ops (as the app layer builds them):
+       { set: [store, obj] } | { del: [store, id] } | { stock: [id, delta] }
+       | { setting: [key, value|undefined] }
+     All are applied locally + queued in ONE local transaction, and later
+     uploaded together in one server transaction. */
+  async function commit(ops) {
+    const queued = [], rows = [];
     for (const op of ops) {
       if (op.set) {
         const [store, obj] = op.set;
-        cache[store].set(obj.id, clone(obj));
-        writes.push(b => b.set(ref(store, obj.id), clone(obj)));
+        const data = clone(obj);
+        setLocal(store, obj.id, data);
+        rows.push([store, String(obj.id), data]);
+        queued.push({ t: 'upsert', store, key: String(obj.id), data });
       } else if (op.del) {
         const [store, id] = op.del;
-        cache[store].delete(id);
-        writes.push(b => b.delete(ref(store, id)));
+        setLocal(store, id, null);
+        rows.push([store, String(id), null]);
+        queued.push({ t: 'delete', store, key: String(id) });
       } else if (op.stock) {
-        // Stock changes are sent as increments, so two devices changing the
-        // same product's stock at the same time add up instead of overwriting.
         const [id, delta] = op.stock;
-        if (!delta) continue;
         const p = cache.products.get(id);
-        if (!p) continue;
+        if (!delta || !p) continue;
         p.stock = (p.stock || 0) + delta;
-        writes.push(b => b.update(ref('products', id), { stock: FV.increment(delta) }));
+        rows.push(['products', String(id), p]);
+        queued.push({ t: 'stock', store: 'products', key: String(id), delta });
       } else if (op.setting) {
         const [key, value] = op.setting;
-        if (value === undefined) delete settings[key]; else settings[key] = value;
-        writes.push(b => b.set(settingsRef(), { [key]: value === undefined ? FV.delete() : value }, { merge: true }));
+        const v = value === undefined ? null : value;
+        setLocal('settings', key, v);
+        rows.push(['settings', key, v]);
+        queued.push(v === null ? { t: 'delete', store: 'settings', key } : { t: 'upsert', store: 'settings', key, data: v });
       }
     }
-    // Firestore allows 500 writes per batch; big imports are split up.
-    for (let i = 0; i < writes.length; i += 450) {
-      const b = fs.batch();
-      writes.slice(i, i + 450).forEach(w => w(b));
-      b.commit().catch(err => onWriteError(err));
+    if (!queued.length) return;
+    queued.forEach(q => { q.opId = uuid(); });
+    const added = await idbTx(['records', 'outbox'], t => {
+      const r = t.objectStore('records'), o = t.objectStore('outbox');
+      rows.forEach(([store, key, data]) => {
+        if (data === null) r.delete([store, key]); else r.put({ store, key, data });
+      });
+      const out = [];
+      queued.forEach(op => { const req = o.add({ op }); req.onsuccess = () => out.push({ seq: req.result, op }); });
+      return out;
+    });
+    added.sort((a, b) => a.seq - b.seq).forEach(e => {
+      outbox.push(e);
+      pending.set(pkey(e.op.store, e.op.key), (pending.get(pkey(e.op.store, e.op.key)) || 0) + 1);
+    });
+    notifyStatus();
+    flush();
+  }
+
+  /* ---------------- Uploading ---------------- */
+  const isNetworkError = err => !err || err instanceof TypeError ||
+    /fetch|network|load failed|timeout/i.test(String(err.message || err));
+
+  async function flush() {
+    clearTimeout(flushTimer);
+    if (!sb || flushing || !outbox.length) return;
+    flushing = true;
+    try {
+      while (outbox.length) {
+        const batch = outbox.slice(0, 200);
+        const { error } = await sb.rpc('apply_ops', { ops: batch.map(e => e.op) });
+        if (error) throw error;
+        await idbTx(['outbox'], t => batch.forEach(e => t.objectStore('outbox').delete(e.seq)));
+        outbox.splice(0, batch.length);
+        batch.forEach(e => {
+          const k = pkey(e.op.store, e.op.key);
+          const n = (pending.get(k) || 1) - 1;
+          if (n > 0) pending.set(k, n); else pending.delete(k);
+        });
+        notifyStatus();
+      }
+      flushing = false;
+      pull(); // pick up the server's version (e.g. stock after other devices' changes)
+    } catch (err) {
+      flushing = false;
+      if (!isNetworkError(err)) onSyncError(err);
+      flushTimer = setTimeout(flush, 15000);
     }
   }
 
-  const notify = info => changeListeners.forEach(fn => { try { fn(info); } catch (e) { console.error(e); } });
+  /* ---------------- Downloading ---------------- */
+  // Rows changed by others. Rows with our own changes still queued are
+  // skipped — our upload is newer and the next pull brings the result.
+  function applyRemote(rows) {
+    let changed = false;
+    const puts = [];
+    for (const row of rows) {
+      if (row.updated_at && (!lastSync || row.updated_at > lastSync)) lastSync = row.updated_at;
+      if (pending.has(pkey(row.store, row.key))) continue;
+      if (row.store !== 'settings' && !cache[row.store]) continue;
+      const data = row.deleted ? null : row.data;
+      if (JSON.stringify(getLocal(row.store, row.key) ?? null) === JSON.stringify(data ?? null)) continue;
+      setLocal(row.store, row.key, data);
+      puts.push([row.store, row.key, data]);
+      changed = true;
+    }
+    const ls = lastSync;
+    idbTx(['records', 'meta'], t => {
+      const r = t.objectStore('records');
+      puts.forEach(([store, key, data]) => {
+        if (data === null) r.delete([store, key]); else r.put({ store, key, data });
+      });
+      if (ls) t.objectStore('meta').put(ls, 'lastSync');
+    }).catch(err => console.error(err));
+    if (changed) notifyChange();
+    return changed;
+  }
+
+  let pulling = null;
+  function pull() {
+    if (!sb) return Promise.resolve();
+    if (pulling) return pulling;
+    pulling = (async () => {
+      try {
+        // Re-read a short overlap: a change saved just before our last read
+        // can carry a slightly older timestamp.
+        let since = lastSync ? new Date(new Date(lastSync).getTime() - 30000).toISOString() : null;
+        for (;;) {
+          let q = sb.from('records').select('store,key,data,deleted,updated_at').order('updated_at').limit(1000);
+          if (since) q = q.gt('updated_at', since);
+          const { data, error } = await q;
+          if (error) throw error;
+          applyRemote(data);
+          if (data.length < 1000) break;
+          since = data[data.length - 1].updated_at;
+        }
+        lastPullOk = Date.now();
+        notifyStatus();
+      } catch (err) {
+        if (!isNetworkError(err)) onSyncError(err);
+      } finally {
+        pulling = null;
+      }
+    })();
+    return pulling;
+  }
+  let lastPullOk = 0;
+
+  function listen() {
+    if (channel) sb.removeChannel(channel);
+    channel = sb.channel('buddyboard-records')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'records' }, payload => {
+        if (payload.new && payload.new.store) applyRemote([payload.new]);
+      })
+      .subscribe(status => { if (status === 'SUBSCRIBED') pull(); });
+  }
+
+  /* ---------------- Status / change listeners ---------------- */
+  const notifyChange = () => changeListeners.forEach(fn => { try { fn(); } catch (e) { console.error(e); } });
+  const notifyStatus = () => {
+    const s = api.status();
+    statusListeners.forEach(fn => { try { fn(s); } catch (e) { console.error(e); } });
+  };
 
   const api = {
-    /* Connects to Firestore and resolves once every collection has been
-       loaded (from the device cache or the server). After that, every
-       change — local or from another device — calls the onChange
-       listeners. Returns an unsubscribe function. */
-    start(firestore, { onError } = {}) {
-      fs = firestore;
-      if (onError) onWriteError = onError;
-      const unsubs = [];
-      return new Promise((resolve, reject) => {
-        let waiting = STORES.length + 1;
-        const loaded = () => { if (--waiting === 0) resolve(() => unsubs.forEach(u => u())); };
-        STORES.forEach(store => {
-          let first = true;
-          unsubs.push(fs.collection(store).onSnapshot(snap => {
-            const m = new Map();
-            snap.forEach(d => { const v = d.data(); m.set(v.id, v); });
-            cache[store] = m;
-            if (first) { first = false; loaded(); }
-            else notify({ store, remote: !snap.metadata.hasPendingWrites });
-          }, err => { if (first) reject(err); else onWriteError(err); }));
-        });
-        let firstS = true;
-        unsubs.push(settingsRef().onSnapshot(d => {
-          settings = d.exists ? d.data() : {};
-          if (firstS) { firstS = false; loaded(); }
-          else notify({ store: 'settings', remote: !d.metadata.hasPendingWrites });
-        }, err => { if (firstS) reject(err); else onWriteError(err); }));
+    /* Load the local copy of the data (works offline). */
+    async load() {
+      const db = await idb();
+      const t = db.transaction(['records', 'outbox', 'meta']);
+      const [records, queued, ls] = await Promise.all([
+        getAllFrom(t, 'records'), getAllFrom(t, 'outbox'),
+        new Promise(r => { t.objectStore('meta').get('lastSync').onsuccess = e => r(e.target.result); })
+      ]);
+      records.forEach(r => setLocal(r.store, r.key, r.data));
+      outbox = queued.sort((a, b) => a.seq - b.seq);
+      outbox.forEach(e => {
+        const k = pkey(e.op.store, e.op.key);
+        pending.set(k, (pending.get(k) || 0) + 1);
       });
+      lastSync = ls || null;
     },
 
+    /* Start syncing with Supabase (after sign-in). Resolves after the
+       first download attempt. */
+    async connect(client, { onError } = {}) {
+      if (onError) onSyncError = onError;
+      if (!sb) {
+        const kick = () => { flush(); pull(); };
+        window.addEventListener('online', kick);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) kick(); });
+        pullTimer = setInterval(kick, 60000); // safety net if a live update was missed
+      }
+      sb = client;
+      listen();
+      flush();
+      await pull();
+    },
+
+    hasData() { return STORES.some(s => cache[s].size) || Object.keys(settings).length > 0; },
+    pendingCount() { return outbox.length; },
+    status() { return { pending: outbox.length, lastPullOk }; },
+    onStatus(fn) { statusListeners.add(fn); return () => statusListeners.delete(fn); },
     onChange(fn) { changeListeners.add(fn); return () => changeListeners.delete(fn); },
+    syncNow() { flush(); return pull(); },
+
+    /* Forget everything stored on this device (on sign-out). */
+    async wipeLocal() {
+      STORES.forEach(s => cache[s].clear());
+      settings = {}; outbox = []; pending.clear(); lastSync = null;
+      await idbTx(['records', 'outbox', 'meta'], t => ['records', 'outbox', 'meta'].forEach(s => t.objectStore(s).clear()));
+    },
 
     /* Shared settings (receipt footer, profit split, bank baseline, order
        counter…) — the same on every device. */
     setting(key) { return settings[key] ?? null; },
-    setSetting(key, value) { commit([{ setting: [key, value] }]); },
-    removeSetting(key) { commit([{ setting: [key, undefined] }]); },
+    setSetting(key, value) { return commit([{ setting: [key, value] }]); },
+    removeSetting(key) { return commit([{ setting: [key, undefined] }]); },
 
     async getAll(store) { return [...cache[store].values()].map(clone); },
     async get(store, id) { return clone(cache[store].get(id)); },
     async add(store, value) {
       value.id = genId();
-      commit([{ set: [store, value] }]);
+      await commit([{ set: [store, value] }]);
       return value.id;
     },
     async put(store, value) {
       if (value.id == null) return api.add(store, value);
-      commit([{ set: [store, value] }]);
+      await commit([{ set: [store, value] }]);
       return value.id;
     },
-    async delete(store, id) { commit([{ del: [store, id] }]); },
-    async addStock(productId, delta) { commit([{ stock: [productId, delta] }]); },
+    async delete(store, id) { await commit([{ del: [store, id] }]); },
+    async addStock(productId, delta) { await commit([{ stock: [productId, delta] }]); },
 
-    /* Create an order and reserve stock in one atomic write.
+    /* Create an order and reserve stock in one atomic change.
        - deduct=false: past orders that were already fulfilled — stock untouched.
        - deduct=true: take what's available; any shortfall is stored on the
          item as pendingQty ("awaiting stock") instead of failing the order. */
@@ -153,7 +334,7 @@ const DB = (() => {
       }
       order.id = genId();
       ops.unshift({ set: ['orders', order] });
-      commit(ops);
+      await commit(ops);
       return order.id;
     },
 
@@ -186,7 +367,7 @@ const DB = (() => {
         if (stock === 0) break;
       }
       ops.push({ stock: [productId, stock - p.stock] });
-      commit(ops);
+      await commit(ops);
       return allocations;
     },
 
@@ -212,7 +393,7 @@ const DB = (() => {
           ops.push({ set: [store, r] });
         });
       });
-      commit(ops);
+      await commit(ops);
     },
 
     /* Replace an order's items/customer/totals. Stock handling: first give
@@ -252,7 +433,7 @@ const DB = (() => {
         }
       });
       ops.unshift({ set: ['orders', o] });
-      commit(ops);
+      await commit(ops);
     },
 
     /* Update the actual sold grams of weight items on an order.
@@ -284,7 +465,7 @@ const DB = (() => {
         const before = p.stock || 0;
         ops.push({ stock: [productId, Math.max(0, before - delta) - before] });
       });
-      commit(ops);
+      await commit(ops);
     }
   };
 
