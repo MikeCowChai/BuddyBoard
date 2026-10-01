@@ -1,10 +1,32 @@
+/* ---- Build stamp + crash visibility ----------------------------------
+   If ANYTHING crashes, a red banner shows the actual error message on
+   screen instead of the app silently dying. The build number makes it
+   possible to verify which version a device is actually running.
+   Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
+   MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
+const BUILD = '2.0.0';
+function showFatal(msg) {
+  try {
+    let b = document.getElementById('errBanner');
+    if (!b) {
+      b = document.createElement('div');
+      b.id = 'errBanner';
+      b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#B3261E;color:#fff;font:12.5px/1.45 system-ui;padding:10px 14px;white-space:pre-wrap;word-break:break-word';
+      (document.body || document.documentElement).appendChild(b);
+    }
+    b.textContent = 'App error — screenshot this and send it: ' + msg + '  [build ' + BUILD + ']';
+  } catch (e) { /* never let the reporter itself crash */ }
+}
+window.addEventListener('error', e => showFatal((e.message || 'unknown error') + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')));
+window.addEventListener('unhandledrejection', e => showFatal(String((e.reason && (e.reason.stack || e.reason.message)) || e.reason).split('\n').slice(0, 3).join(' | ')));
+
 /* ============================================================
    app.js — BuddyBoard
    Views: Dashboard · Inventory (Stock / Incoming purchases)
           Orders · Customers
    ============================================================ */
 
-const STATUSES = ['In production', 'Ready for shipping', 'Completed', 'Delivered'];
+const STATUSES = ['In production', 'Ready for shipping', 'Shipped', 'Delivered'];
 const fmtMoney = n => '฿' + (n || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
 const fmtDate = ts => {
   const d = new Date(ts);
@@ -34,6 +56,14 @@ const lineTotal = l => l.unitType === 'weight' || l.weightBased
   ? Math.floor((l.qty || 0) / 1000 * (l.unitPrice || 0))
   : (l.qty || 0) * (l.unitPrice || 0);
 const $ = sel => document.querySelector(sel);
+/* Settings shared by every device (stored in the cloud, see db.js) — same
+   interface as localStorage so call sites read the same. Per-device
+   preferences (theme, collapsed sections) stay in localStorage. */
+const shared = {
+  getItem: k => DB.setting(k),
+  setItem: (k, v) => DB.setSetting(k, String(v)),
+  removeItem: k => DB.removeSetting(k)
+};
 
 /* Date-input helpers: today keeps the exact current time (natural activity
    ordering); a backdated day is stored at noon local time. */
@@ -43,8 +73,55 @@ const fmtTime = ts => {
 };
 const tsToTimeInput = ts => fmtTime(ts);
 /* Order number format: DNBB + 2-digit year of the order date + 4-digit
-   sequence, e.g. order #7 placed in 2026 → DNBB260007. */
-const orderNo = o => `DNBB${String(new Date(o.createdAt).getFullYear()).slice(-2)}${String(o.id).padStart(4, '0')}`;
+   sequence. IMPORTANT: this uses order.seq, a number BuddyBoard assigns
+   and manages itself — never the database's internal id/key. The internal
+   id is IndexedDB's auto-increment key and must never be shown or edited:
+   IndexedDB permanently raises its key generator to match the highest key
+   ever used, so editing it (even once, even by mistake) can make every
+   later order jump to a huge number. seq has no such trap — it's just a
+   number in a field, safe to reassign freely. */
+const orderNo = o => `DNBB${String(new Date(o.createdAt).getFullYear()).slice(-2)}${String(o.seq ?? o.id).padStart(4, '0')}`;
+
+/* One-time self-heal: assigns clean sequential seq numbers (1, 2, 3…) to
+   every order by creation date, and fixes the counter. Runs once ever;
+   also exposed as a manual "Renumber orders" tool for later cleanup. */
+async function renumberAllOrders() {
+  const orders = await DB.getAll('orders');
+  orders.sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
+  let seq = 1;
+  for (const o of orders) {
+    if (o.seq !== seq) { o.seq = seq; await DB.put('orders', o); }
+    seq++;
+  }
+  shared.setItem('erp_order_seq_next', String(seq));
+  return orders.length;
+}
+/* Gentle self-heal, safe to run at every boot AND after every import:
+   - any order missing a seq (e.g. imported from a v1 backup) gets the next
+     free number, oldest first
+   - the counter is forced past the highest seq in use
+   User-chosen numbers are never touched; full clean-up stays available via
+   Settings → Renumber orders. */
+/* Next free order number: past both the shared counter and every number
+   already in use (another device may just have created an order). */
+async function nextOrderSeq() {
+  const orders = await DB.getAll('orders');
+  const maxSeq = orders.reduce((m, o) => Number.isFinite(o.seq) ? Math.max(m, o.seq) : m, 0);
+  return Math.max(Number(shared.getItem('erp_order_seq_next') || '1'), maxSeq + 1);
+}
+async function ensureOrderSeq() {
+  const orders = await DB.getAll('orders');
+  let maxSeq = 0;
+  orders.forEach(o => { if (Number.isFinite(o.seq)) maxSeq = Math.max(maxSeq, o.seq); });
+  const missing = orders.filter(o => !Number.isFinite(o.seq))
+    .sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
+  for (const o of missing) {
+    o.seq = ++maxSeq;
+    await DB.put('orders', o);
+  }
+  const next = Number(shared.getItem('erp_order_seq_next') || '1');
+  if (next <= maxSeq) shared.setItem('erp_order_seq_next', String(maxSeq + 1));
+}
 const tsToDateInput = ts => {
   const d = new Date(ts);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -58,12 +135,12 @@ const dateInputToTs = str => {
 };
 
 const state = {
-  view: 'dashboard',
-  invTab: 'stock',
+  view: 'home',
+  moneyTab: 'reports',
   stockFilter: 'all',
   purchaseFilter: 'all',
   statusFilter: 'open', // default: everything that isn't Delivered yet
-  period: 'month', // dashboard stats: 'month' | 'quarter' | 'year'
+  period: 'month', // stats: 'month' | 'quarter' | 'year'
   periodOffset: 0, // 0 = current period, -1 = previous, etc.
   search: { product: '', order: '', customer: '' }
 };
@@ -78,46 +155,118 @@ function applyTheme(pref) {
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if ((localStorage.getItem('erp_theme') || 'auto') === 'auto') applyTheme('auto');
 });
-$('#themeBtn').addEventListener('click', () => {
-  const cur = localStorage.getItem('erp_theme') || 'auto';
-  const footer = localStorage.getItem('erp_receipt_footer') || '';
+/* ---------------- Settings (sectioned) ---------------- */
+const THEME_LABELS = { auto: 'System (auto)', light: 'Light', dark: 'Dark' };
+
+function openSettings() {
+  const theme = localStorage.getItem('erp_theme') || 'auto';
+  const bank = bankCfg();
   openSheet(`
     <h2>Settings</h2>
-    <h2 class="section-label" style="margin-top:0">Theme</h2>
-    <div class="chip-row">
-      <button class="chip ${cur === 'auto' ? 'is-selected' : ''}" data-theme-pick="auto">System (auto)</button>
-      <button class="chip ${cur === 'light' ? 'is-selected' : ''}" data-theme-pick="light">Light</button>
-      <button class="chip ${cur === 'dark' ? 'is-selected' : ''}" data-theme-pick="dark">Dark</button>
+
+    <h2 class="section-label" style="margin-top:0">Appearance</h2>
+    <div class="card set-card">
+      <div class="set-row">
+        <div class="set-main"><div class="set-title">Theme</div></div>
+        <div class="chip-row" style="padding:0;margin:0">
+          <button class="chip ${theme === 'auto' ? 'is-selected' : ''}" data-theme-pick="auto">Auto</button>
+          <button class="chip ${theme === 'light' ? 'is-selected' : ''}" data-theme-pick="light">Light</button>
+          <button class="chip ${theme === 'dark' ? 'is-selected' : ''}" data-theme-pick="dark">Dark</button>
+        </div>
+      </div>
     </div>
-    <h2 class="section-label">Receipt footer</h2>
-    <div class="form-card">
-      <label class="field"><span>Shown at the bottom of every shared receipt (name, bank account…)</span>
-        <textarea id="stFooter" rows="4" placeholder="Name:&#10;Your name&#10;Accountnumber SCB 1234567890">${esc(footer)}</textarea>
-      </label>
-      <button class="btn-filled" id="stSave">Save settings</button>
+
+    <h2 class="section-label">Finance</h2>
+    <div class="card set-card">
+      <button class="set-row" id="setBank">
+        <div class="set-main">
+          <div class="set-title">Bank balance</div>
+          <div class="set-sub">${bank ? 'baseline set ' + fmtDate(bank.ts) : 'not set up yet'}</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
+      <button class="set-row" id="setSplit">
+        <div class="set-main">
+          <div class="set-title">Profit split percentages</div>
+          <div class="set-sub">tax, buffer and share distribution</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
     </div>
-    <h2 class="section-label">Backup</h2>
-    <div class="form-card">
-      <button class="btn-tonal" id="stExport">Export all data (JSON)</button>
-      <button class="btn-tonal" id="stImport">Import backup…</button>
+
+    <h2 class="section-label">Receipts</h2>
+    <div class="card set-card">
+      <button class="set-row" id="setFooter">
+        <div class="set-main">
+          <div class="set-title">Receipt footer</div>
+          <div class="set-sub">${(shared.getItem('erp_receipt_footer') || '').trim() ? 'configured' : 'name & bank account for receipts'}</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
+    </div>
+
+    <h2 class="section-label">Data & backup</h2>
+    <div class="card set-card">
+      <button class="set-row" id="stExport">
+        <div class="set-main">
+          <div class="set-title">Export all data</div>
+          <div class="set-sub">share or save a JSON backup</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
+      <button class="set-row" id="stImport">
+        <div class="set-main">
+          <div class="set-title">Import backup…</div>
+          <div class="set-sub">replaces everything in this app</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
       <input type="file" id="stImportFile" accept=".json,application/json" hidden>
-      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant)">Your data lives only on this device. Export a backup regularly and keep it somewhere safe (Drive, email to yourself). Importing replaces everything.</div>
-    </div>`);
+      <button class="set-row" id="stRenumber">
+        <div class="set-main">
+          <div class="set-title">Renumber orders</div>
+          <div class="set-sub">clean up order numbers into 1, 2, 3… by date</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
+    </div>
+    <h2 class="section-label">Account</h2>
+    <div class="card set-card">
+      <button class="set-row" id="stSignOut">
+        <div class="set-main">
+          <div class="set-title">Sign out</div>
+          <div class="set-sub">signed in as ${esc(Cloud.email())}</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
+    </div>
+    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Your data is shared live with every device signed in to this BuddyBoard, and keeps working offline. An occasional exported backup is still a good idea.<br><br>BuddyBoard ${BUILD}</div>`);
+
   document.querySelectorAll('[data-theme-pick]').forEach(c =>
     c.addEventListener('click', () => {
       applyTheme(c.dataset.themePick);
       document.querySelectorAll('[data-theme-pick]').forEach(x => x.classList.toggle('is-selected', x === c));
     }));
-  $('#stSave').onclick = () => {
-    localStorage.setItem('erp_receipt_footer', $('#stFooter').value);
-    closeSheet(); snack('Settings saved');
+
+  $('#setBank').onclick = () => openBankSheet();
+  $('#setSplit').onclick = () => openSplitSettings();
+  $('#setFooter').onclick = () => openFooterSheet();
+  $('#stSignOut').onclick = () => showConfirm('Sign out of BuddyBoard on this device?', () => Cloud.signOut(), 'Sign out');
+  $('#stRenumber').onclick = () => {
+    showConfirm(
+      'Renumber all orders into a clean 1, 2, 3… sequence, ordered by their order date? This changes the DNBB number shown on every order.',
+      async () => { const n = await renumberAllOrders(); snack(`Renumbered ${n} orders`); render(); },
+      'Renumber'
+    );
   };
 
   $('#stExport').onclick = async () => {
     const data = await DB.exportAll();
     data.settings = {
       theme: localStorage.getItem('erp_theme') || 'auto',
-      receiptFooter: localStorage.getItem('erp_receipt_footer') || ''
+      receiptFooter: shared.getItem('erp_receipt_footer') || '',
+      splitCfg: shared.getItem('erp_split_cfg') || '',
+      bank: shared.getItem('erp_bank') || ''
     };
     const name = `buddyboard-backup-${tsToDateInput(Date.now())}.json`;
     const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
@@ -144,29 +293,51 @@ $('#themeBtn').addEventListener('click', () => {
     } catch { return snack('Not a valid BuddyBoard backup file'); }
     const when = data.exportedAt ? new Date(data.exportedAt).toLocaleDateString() : 'unknown date';
     showConfirm(
-      `Import backup from ${when} (${(data.orders || []).length} orders, ${(data.products || []).length} products)? This REPLACES everything currently in the app.`,
+      `Import backup from ${when} (${(data.orders || []).length} orders, ${(data.products || []).length} products)? This REPLACES everything currently in the app — on every device.`,
       async () => {
         await DB.importAll(data);
+        await ensureOrderSeq(); // v1 backups have no seq numbers — assign them now
         if (data.settings) {
           if (data.settings.theme) applyTheme(data.settings.theme);
-          if (data.settings.receiptFooter != null) localStorage.setItem('erp_receipt_footer', data.settings.receiptFooter);
+          if (data.settings.receiptFooter != null) shared.setItem('erp_receipt_footer', data.settings.receiptFooter);
+          if (data.settings.splitCfg) shared.setItem('erp_split_cfg', data.settings.splitCfg);
+          if (data.settings.bank) shared.setItem('erp_bank', data.settings.bank);
         }
-        localStorage.setItem('erp_delivery_seeded', '1');
+        shared.setItem('erp_delivery_seeded', '1');
         closeSheet(); snack('Backup imported'); render();
       },
       'Import'
     );
   };
-});
+}
+
+function openFooterSheet() {
+  const footer = shared.getItem('erp_receipt_footer') || '';
+  openSheet(`
+    <h2>Receipt footer</h2>
+    <div class="form-card">
+      <label class="field"><span>Shown at the bottom of every shared receipt (name, bank account…)</span>
+        <textarea id="stFooter" rows="4" placeholder="Name:&#10;Your name&#10;Accountnumber SCB 1234567890">${esc(footer)}</textarea>
+      </label>
+      <button class="btn-filled" id="stFooterSave">Save</button>
+    </div>`);
+  $('#stFooterSave').onclick = () => {
+    shared.setItem('erp_receipt_footer', $('#stFooter').value);
+    closeSheet(); snack('Receipt footer saved');
+  };
+}
+
+$('#themeBtn').addEventListener('click', openSettings);
 applyTheme(localStorage.getItem('erp_theme') || 'auto');
 
 /* ---------------- Navigation ---------------- */
-const VIEW_TITLES = { dashboard: 'Dashboard', inventory: 'Inventory', orders: 'Orders', customers: 'Customers' };
+const VIEW_TITLES = { home: 'BuddyBoard', orders: 'Orders', stock: 'Stock', money: 'Money', customers: 'Customers' };
 const FAB_CONFIG = {
-  dashboard: { label: 'Order',   action: () => openOrderForm() },
-  inventory: { label: 'Product', action: () => openProductForm() },
-  orders:    { label: 'Order',   action: () => openOrderForm() },
-  customers: { label: 'Customer',action: () => openCustomerForm() }
+  home:      { label: 'Order',    action: () => openOrderForm() },
+  orders:    { label: 'Order',    action: () => openOrderForm() },
+  stock:     { label: 'Product',  action: () => openProductForm() },
+  customers: { label: 'Customer', action: () => openCustomerForm() }
+  // money: FAB depends on sub-tab, handled below
 };
 
 function switchView(view) {
@@ -177,8 +348,9 @@ function switchView(view) {
   $('#viewTitle').textContent = VIEW_TITLES[view];
 
   const fab = $('#fab');
-  const cfg = FAB_CONFIG[view];
-  fab.hidden = !cfg || (view === 'inventory' && state.invTab === 'purchases');
+  let cfg = FAB_CONFIG[view];
+  if (view === 'money' && state.moneyTab === 'expenses') cfg = null; // expenses has its own inline form
+  fab.hidden = !cfg;
   if (cfg) { $('#fabLabel').textContent = cfg.label; fab.onclick = cfg.action; }
 
   render();
@@ -186,6 +358,16 @@ function switchView(view) {
 
 document.querySelectorAll('.nav-item').forEach(b =>
   b.addEventListener('click', () => switchView(b.dataset.view)));
+
+/* Jump to a specific Money sub-tab from elsewhere (e.g. Home cards). */
+function setMoneyTab(name) {
+  state.moneyTab = name;
+  document.querySelectorAll('[data-moneytab]').forEach(t => t.classList.toggle('is-active', t.dataset.moneytab === name));
+  $('#money-reports').hidden = name !== 'reports';
+  $('#money-bank').hidden = name !== 'bank';
+  $('#money-split').hidden = name !== 'split';
+  $('#money-expenses').hidden = name !== 'expenses';
+}
 
 /* ---------------- Sheet (modal) ---------------- */
 function openSheet(html) {
@@ -210,6 +392,36 @@ function closeSheet() {
   $('#scrim').hidden = true;
 }
 $('#scrim').addEventListener('click', closeSheet);
+{ const b = $('#sheetClose'); if (b) b.addEventListener('click', closeSheet); }
+
+/* The handle strip is a guaranteed dismiss zone: dragging it down always
+   closes the sheet, regardless of where the content is scrolled. */
+(function enableHandleDrag() {
+  const sheet = $('#sheet');
+  const handle = $('#sheetHandle');
+  if (!sheet || !handle) return; // older index.html — degrade gracefully
+  let startY = 0, dy = 0, active = false;
+  handle.addEventListener('touchstart', e => {
+    active = true; dy = 0;
+    startY = e.touches[0].clientY;
+    sheet.style.transition = 'none';
+  }, { passive: true });
+  handle.addEventListener('touchmove', e => {
+    if (!active) return;
+    e.preventDefault();
+    dy = e.touches[0].clientY - startY;
+    sheet.style.transform = `translateY(${Math.max(0, dy)}px)`;
+  }, { passive: false });
+  const end = () => {
+    if (!active) return;
+    active = false;
+    sheet.style.transition = 'transform .2s ease';
+    if (dy > 90) closeSheet();
+    else sheet.style.transform = '';
+  };
+  handle.addEventListener('touchend', end);
+  handle.addEventListener('touchcancel', end);
+})();
 
 /* Swipe down to dismiss the sheet. Non-passive touchmove lets us take over
    from native scrolling; drag only engages when content is at the top. */
@@ -306,20 +518,15 @@ function snack(msg) {
 
 /* ---------------- Rendering ---------------- */
 async function render() {
-  if (state.view === 'dashboard') renderDashboard();
-  if (state.view === 'inventory') { renderProducts(); renderPurchases(); }
+  if (state.view === 'home') renderHome();
   if (state.view === 'orders') renderOrders();
+  if (state.view === 'stock') { renderProducts(); renderStockOutlook(); }
+  if (state.view === 'money') { renderReports(); renderBank(); renderSplit(); renderPurchases(); }
   if (state.view === 'customers') renderCustomers();
 }
 
-/* ----- Dashboard ----- */
-const SEC_DEFAULTS = { chart: '1', cat: '0', sellers: '0', outlook: '0', activity: '1' };
-const isSecOpen = k => (localStorage.getItem('erp_sec_' + k) ?? SEC_DEFAULTS[k]) === '1';
-async function renderDashboard() {
-  const [orders, products, purchases] = await Promise.all([
-    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases')
-  ]);
-
+/* ----- Shared period computation ----- */
+function computePeriod() {
   const now = new Date();
   const off = state.periodOffset;
   let pStart, pEnd, periodLabel;
@@ -337,203 +544,105 @@ async function renderDashboard() {
     pEnd = new Date(now.getFullYear() + off + 1, 0, 1);
     periodLabel = String(pStart.getFullYear());
   }
-  const periodStart = pStart.getTime(), periodEnd = pEnd.getTime();
+  return { start: pStart.getTime(), end: pEnd.getTime(), label: periodLabel, off };
+}
+const fmtCompact = n => n >= 10000 ? '฿' + Math.round(n / 1000) + 'k' : n >= 1000 ? '฿' + (n / 1000).toFixed(1) + 'k' : '฿' + n;
+// Products flagged to be left out of sales reports (e.g. Delivery/Shipping).
+const inReports = i => !i.excludeReports;
 
-  // Payment is taken before shipping, so every order placed counts as revenue.
-  const periodOrders = orders.filter(o => o.createdAt >= periodStart && o.createdAt < periodEnd);
-  const revenue = periodOrders.reduce((s, o) => s + o.total, 0);
-  const periodPurchases = purchases.filter(pu => pu.receivedAt >= periodStart && pu.receivedAt < periodEnd);
-  const costs = periodPurchases.reduce((s, pu) => s + (pu.amount || 0), 0);
+/* ----- HOME (slim: current status only) ----- */
+async function renderHome() {
+  const [orders, products, purchases] = await Promise.all([
+    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases')
+  ]);
+
+  const empty = !orders.length && !products.length;
+  if (empty) {
+    $('#view-home').innerHTML = `
+      <div class="empty">
+        <div class="title">BuddyBoard is empty</div>
+        <div>Add products and orders, or start with sample data to explore the app.</div>
+        <button class="btn-tonal" id="seedBtn">Load sample data</button>
+      </div>`;
+    const seed = $('#seedBtn');
+    if (seed) seed.onclick = seedSampleData;
+    return;
+  }
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const monthOrders = orders.filter(o => o.createdAt >= monthStart);
+  const revenue = monthOrders.reduce((s, o) => s + o.total, 0);
+  const costs = purchases.filter(pu => pu.receivedAt >= monthStart).reduce((s, pu) => s + (pu.amount || 0), 0);
   const profit = revenue - costs;
-
-  // Month-on-month revenue vs costs, last 6 months (independent of the selector).
-  const monthly = [...Array(6)].map((_, k) => {
-    const s = new Date(now.getFullYear(), now.getMonth() - 5 + k, 1).getTime();
-    const e = new Date(now.getFullYear(), now.getMonth() - 4 + k, 1).getTime();
-    const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((sum, o) => sum + o.total, 0);
-    const cost = purchases.filter(pu => pu.receivedAt >= s && pu.receivedAt < e).reduce((sum, pu) => sum + (pu.amount || 0), 0);
-    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), rev, cost, current: k === 5 };
-  });
-  const maxRev = Math.max(1, ...monthly.map(m => Math.max(m.rev, m.cost)));
-  const fmtCompact = n => n >= 10000 ? '฿' + Math.round(n / 1000) + 'k' : n >= 1000 ? '฿' + (n / 1000).toFixed(1) + 'k' : '฿' + n;
-
-  // Best & worst sellers within the selected period, ranked by revenue.
-  const perf = {};
-  periodOrders.forEach(o => o.items.forEach(i => {
-    const lt = i.lineTotal !== undefined ? i.lineTotal : i.qty * i.unitPrice;
-    if (!perf[i.name]) perf[i.name] = { name: i.name, revenue: 0, qty: 0, weight: i.unitType === 'weight' };
-    perf[i.name].revenue += lt;
-    perf[i.name].qty += i.qty;
-  }));
-  const perfRows = Object.values(perf).sort((a, b) => b.revenue - a.revenue).slice(0, 8);
-  const maxPerf = perfRows.length ? perfRows[0].revenue : 1;
-
-  // Stock outlook: how long current stock lasts at the sales rate of the
-  // last 90 days. Only tracked products that actually sold in that window.
-  const OUTLOOK_DAYS = 90;
-  const soldSince = Date.now() - OUTLOOK_DAYS * 86400000;
-  const soldPer = {};
-  orders.forEach(o => {
-    if (o.createdAt < soldSince) return;
-    o.items.forEach(i => { soldPer[i.productId] = (soldPer[i.productId] || 0) + i.qty; });
-  });
-  const outlook = products
-    .filter(p => p.trackStock !== false && soldPer[p.id] > 0)
-    .map(p => {
-      const perDay = soldPer[p.id] / OUTLOOK_DAYS;
-      return { p, perMonth: perDay * 30, daysLeft: p.stock / perDay };
-    })
-    .sort((a, b) => a.daysLeft - b.daysLeft)
-    .slice(0, 5);
+  const monthLabel = now.toLocaleDateString(undefined, { month: 'long' });
 
   const inProduction = orders.filter(o => o.status === STATUSES[0]).length;
   const readyToShip = orders.filter(o => o.status === STATUSES[1]).length;
-  // Current stock value at selling price; weight stock is in grams, priced per kg.
-  const stockValue = products.reduce((s, p) => {
-    if (p.trackStock === false) return s;
-    return s + (p.unit === 'weight' ? Math.floor(p.stock / 1000 * (p.price || 0)) : p.stock * (p.price || 0));
-  }, 0);
+  const completed = orders.filter(o => o.status === STATUSES[2]).length;
+  const openTotal = orders.filter(o => o.status !== 'Delivered').length;
   const lowStock = products.filter(p => p.trackStock !== false && p.stock > 0 && p.stock <= p.lowStock).length;
   const outOfStock = products.filter(p => p.trackStock !== false && p.stock === 0).length;
+  const awaiting = orders.filter(o => o.items.some(i => i.pendingQty > 0)).length;
 
-  // Activity feed: newest order events + stock receipts, merged.
+  // Live bank balance (only when tracking is set up).
+  const bank = bankCfg();
+  let bankBalance = null;
+  if (bank) {
+    const inflow = orders.filter(o => o.createdAt >= bank.ts).reduce((s, o) => s + o.total, 0);
+    const outflow = purchases.filter(p => p.receivedAt >= bank.ts && hitsBank(p)).reduce((s, p) => s + (p.amount || 0), 0);
+    bankBalance = bank.amount + inflow - outflow;
+  }
+
+  // Recent activity, kept on home as the quick "what happened" glance.
   const events = [];
   orders.forEach(o => {
     events.push({ ts: o.createdAt, type: 'sale', text: `${orderNo(o)} — ${esc(o.customerName)}, ${fmtMoney(o.total)}` });
     if (o.statusChangedAt && o.status !== STATUSES[0])
       events.push({ ts: o.statusChangedAt, type: 'status', text: `${orderNo(o)} moved to “${o.status}”` });
   });
-  purchases.forEach(p => events.push({ ts: p.receivedAt, type: 'stock', text: `Spent ${fmtMoney(p.amount)} on ${esc(p.description)}${p.supplier ? ' — ' + esc(p.supplier) : ''}` }));
+  purchases.forEach(p => events.push({ ts: p.receivedAt, type: 'stock', text: `Spent ${fmtMoney(p.amount)} on ${esc(p.description)}` }));
   events.sort((a, b) => b.ts - a.ts);
 
-  const empty = !orders.length && !products.length;
-  $('#view-dashboard').innerHTML = empty ? `
-    <div class="empty">
-      <div class="title">BuddyBoard is empty</div>
-      <div>Add products and orders, or start with sample data to explore the app.</div>
-      <button class="btn-tonal" id="seedBtn">Load sample data</button>
-    </div>` : `
-    <div class="chip-row" id="periodChips">
-      <button class="chip ${state.period === 'month' ? 'is-selected' : ''}" data-period="month">Month</button>
-      <button class="chip ${state.period === 'quarter' ? 'is-selected' : ''}" data-period="quarter">Quarter</button>
-      <button class="chip ${state.period === 'year' ? 'is-selected' : ''}" data-period="year">Year</button>
-    </div>
-    <div class="period-nav">
-      <button id="periodPrev" title="Previous">‹</button>
-      <span class="label">${periodLabel}</span>
-      <button id="periodNext" title="Next" ${off >= 0 ? 'disabled' : ''}>›</button>
-    </div>
+  $('#view-home').innerHTML = `
     <div class="stat-grid">
       <div class="stat-card hero">
-        <div class="label">Revenue · ${periodLabel}</div>
-        <div class="value">${fmtMoney(revenue)}</div>
-        <div class="hint">${periodOrders.length} order${periodOrders.length === 1 ? '' : 's'}</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Costs · ${periodLabel}</div>
-        <div class="value">${fmtMoney(costs)}</div>
-        <div class="hint">${periodPurchases.length} purchase${periodPurchases.length === 1 ? '' : 's'}</div>
-      </div>
-      <div class="stat-card ${profit < 0 ? 'warn' : ''}">
-        <div class="label">Profit · ${periodLabel}</div>
+        <div class="label">Profit · ${monthLabel}</div>
         <div class="value">${profit < 0 ? '−' + fmtMoney(-profit) : fmtMoney(profit)}</div>
-        <div class="hint">revenue − costs</div>
+        <div class="hint">${fmtMoney(revenue)} revenue · ${fmtMoney(costs)} costs</div>
       </div>
-      <div class="stat-card">
-        <div class="label">In production</div>
-        <div class="value">${inProduction}</div>
+      <div class="stat-card tappable" data-goto="orders" data-status="open">
+        <div class="label">Open orders</div>
+        <div class="value">${openTotal}</div>
+        <div class="hint">${inProduction} in production · ${readyToShip} ready</div>
       </div>
-      <div class="stat-card">
-        <div class="label">Ready for shipping</div>
-        <div class="value">${readyToShip}</div>
+      <div class="stat-card tappable" data-goto="orders" data-status="Shipped">
+        <div class="label">Shipped</div>
+        <div class="value">${completed}</div>
+        <div class="hint">on the way, not delivered yet</div>
       </div>
-      <div class="stat-card">
-        <div class="label">Stock value</div>
-        <div class="value">${fmtMoney(stockValue)}</div>
-        <div class="hint">stock × selling price</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Unrealised · ${periodLabel}</div>
-        <div class="value">${(profit + stockValue) < 0 ? '−' + fmtMoney(-(profit + stockValue)) : fmtMoney(profit + stockValue)}</div>
-        <div class="hint">profit + stock value if sold</div>
-      </div>
+      ${bankBalance !== null ? `
+      <div class="stat-card tappable" data-goto="money" data-moneysub="bank" style="grid-column:1/-1">
+        <div class="label">Bank balance (tracked)</div>
+        <div class="value">${bankBalance < 0 ? '−' + fmtMoney(-bankBalance) : fmtMoney(bankBalance)}</div>
+        <div class="hint">tap for movements & re-anchor</div>
+      </div>` : ''}
       ${(lowStock + outOfStock) ? `
-      <div class="stat-card warn" style="grid-column:1/-1" id="lowStockCard" role="button" tabindex="0">
+      <div class="stat-card warn tappable" data-goto="stock" data-stock="low" style="grid-column:1/-1">
         <div class="label">Stock alerts</div>
         <div class="value">${lowStock + outOfStock}</div>
         <div class="hint">${lowStock} low · ${outOfStock} out of stock — tap to review</div>
       </div>` : ''}
+      ${awaiting ? `
+      <div class="stat-card tappable" data-goto="orders" data-status="open" style="grid-column:1/-1">
+        <div class="label">Awaiting stock</div>
+        <div class="value">${awaiting}</div>
+        <div class="hint">order${awaiting === 1 ? '' : 's'} waiting for incoming stock</div>
+      </div>` : ''}
     </div>
-    <details class="section" data-sec="chart" ${isSecOpen('chart') ? 'open' : ''}>
-    <summary class="section-label">Revenue vs costs · last 6 months</summary>
+    <h2 class="section-label">Recent activity</h2>
     <div class="card">
-      <div class="chart">
-        ${monthly.map(m => `
-          <div class="chart-col ${m.current ? 'is-current' : ''}">
-            <span class="chart-val">${m.rev ? fmtCompact(m.rev) : ''}</span>
-            <div class="chart-bars">
-              <div class="chart-bar" style="height:${Math.round(m.rev / maxRev * 100)}%" title="Revenue ${fmtMoney(m.rev)}"></div>
-              <div class="chart-bar cost" style="height:${Math.round(m.cost / maxRev * 100)}%" title="Costs ${fmtMoney(m.cost)}"></div>
-            </div>
-            <span class="chart-label">${m.label}</span>
-          </div>`).join('')}
-      </div>
-      <div class="chart-legend">
-        <span><span class="legend-dot rev"></span>Revenue</span>
-        <span><span class="legend-dot cost"></span>Costs</span>
-      </div>
-    </div>
-    </details>
-    ${costs > 0 ? (() => {
-      const byCat = {};
-      periodPurchases.forEach(pu => {
-        const c = pu.category || 'Other';
-        byCat[c] = (byCat[c] || 0) + (pu.amount || 0);
-      });
-      const rows = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
-      const maxCat = rows[0][1];
-      return `
-      <details class="section" data-sec="cat" ${isSecOpen('cat') ? 'open' : ''}>
-      <summary class="section-label">Costs by category · ${periodLabel}</summary>
-      <div class="card">
-        ${rows.map(([c, amt]) => `
-          <div class="tc-row">
-            <div class="tc-name">${c}</div>
-            <div class="tc-track"><div class="tc-fill cost" style="width:${Math.max(4, Math.round(amt / maxCat * 100))}%"></div></div>
-            <div class="tc-amount">${fmtMoney(amt)}</div>
-          </div>`).join('')}
-      </div>
-      </details>`;
-    })() : ''}
-    ${perfRows.length ? `
-    <details class="section" data-sec="sellers" ${isSecOpen('sellers') ? 'open' : ''}>
-    <summary class="section-label">Best & worst sellers · ${periodLabel}</summary>
-    <div class="card">
-      ${perfRows.map(r => `
-        <div class="tc-row">
-          <div class="tc-name">${esc(r.name)}</div>
-          <div class="tc-track"><div class="tc-fill" style="width:${Math.max(4, Math.round(r.revenue / maxPerf * 100))}%"></div></div>
-          <div class="tc-amount">${fmtMoney(r.revenue)}<div class="sub" style="font-weight:400;font-size:11px;color:var(--md-on-surface-variant)">${r.weight ? fmtGrams(r.qty) : r.qty + '×'}</div></div>
-        </div>`).join('')}
-    </div>
-    </details>` : ''}
-    ${outlook.length ? `
-    <details class="section" data-sec="outlook" ${isSecOpen('outlook') ? 'open' : ''}>
-    <summary class="section-label">Stock outlook · at current sales pace</summary>
-    <div class="card">
-      ${outlook.map(x => `
-        <div class="tc-row">
-          <div class="tc-name">${esc(x.p.name)}</div>
-          <div class="tc-track"><div class="tc-fill ${x.daysLeft < 14 ? 'cost' : ''}" style="width:${Math.max(4, Math.min(100, Math.round(x.daysLeft / 60 * 100)))}%"></div></div>
-          <div class="tc-amount">${x.p.stock === 0 ? 'out now' : '~' + Math.round(x.daysLeft) + ' days'}<div class="sub" style="font-weight:400;font-size:11px;color:var(--md-on-surface-variant)">sells ${x.p.unit === 'weight' ? fmtGrams(Math.round(x.perMonth)) : Math.round(x.perMonth)}/mo</div></div>
-        </div>`).join('')}
-      <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);margin-top:6px">based on the last 90 days of sales — amber = under 2 weeks left</div>
-    </div>
-    </details>` : ''}
-    <details class="section" data-sec="activity" ${isSecOpen('activity') ? 'open' : ''}>
-    <summary class="section-label">Recent activity</summary>
-    <div class="card">
-      ${events.slice(0, 8).map(e => `
+      ${events.slice(0, 6).map(e => `
         <div class="activity-item">
           <span class="activity-ico ${e.type === 'sale' ? 'sale' : ''}">
             ${e.type === 'stock'
@@ -547,21 +656,427 @@ async function renderDashboard() {
             <div class="when">${timeAgo(e.ts)}</div>
           </div>
         </div>`).join('') || '<div class="empty">No activity yet.</div>'}
-    </div>
-    </details>`;
+    </div>`;
 
-  const seed = $('#seedBtn');
-  if (seed) seed.onclick = seedSampleData;
-  const lowCard = $('#lowStockCard');
-  if (lowCard) lowCard.onclick = () => { state.stockFilter = 'low'; switchView('inventory'); syncStockChips(); };
-  document.querySelectorAll('#periodChips [data-period]').forEach(chip =>
-    chip.addEventListener('click', () => { state.period = chip.dataset.period; state.periodOffset = 0; renderDashboard(); }));
-  document.querySelectorAll('#view-dashboard details[data-sec]').forEach(d =>
-    d.addEventListener('toggle', () => localStorage.setItem('erp_sec_' + d.dataset.sec, d.open ? '1' : '0')));
-  const prev = $('#periodPrev'), next = $('#periodNext');
-  if (prev) prev.onclick = () => { state.periodOffset--; renderDashboard(); };
-  if (next) next.onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderDashboard(); } };
+  document.querySelectorAll('#view-home .tappable').forEach(card =>
+    card.addEventListener('click', () => {
+      if (card.dataset.status) state.statusFilter = card.dataset.status;
+      if (card.dataset.stock) { state.stockFilter = card.dataset.stock; }
+      if (card.dataset.moneysub) setMoneyTab(card.dataset.moneysub);
+      switchView(card.dataset.goto);
+      if (card.dataset.status) syncStatusChips();
+      if (card.dataset.stock) syncStockChips();
+    }));
 }
+
+/* ----- MONEY: reports ----- */
+async function renderReports() {
+  const [orders, products, purchases] = await Promise.all([
+    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases')
+  ]);
+  const now = new Date();
+  const per = computePeriod();
+
+  const periodOrders = orders.filter(o => o.createdAt >= per.start && o.createdAt < per.end);
+  const revenue = periodOrders.reduce((s, o) => s + o.total, 0);
+  const periodPurchases = purchases.filter(pu => pu.receivedAt >= per.start && pu.receivedAt < per.end);
+  const costs = periodPurchases.reduce((s, pu) => s + (pu.amount || 0), 0);
+  const profit = revenue - costs;
+
+  const stockValue = products.reduce((s, p) => {
+    if (p.trackStock === false) return s;
+    return s + (p.unit === 'weight' ? Math.floor(p.stock / 1000 * (p.price || 0)) : p.stock * (p.price || 0));
+  }, 0);
+
+  const monthly = [...Array(6)].map((_, k) => {
+    const s = new Date(now.getFullYear(), now.getMonth() - 5 + k, 1).getTime();
+    const e = new Date(now.getFullYear(), now.getMonth() - 4 + k, 1).getTime();
+    const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((sum, o) => sum + o.total, 0);
+    const cost = purchases.filter(pu => pu.receivedAt >= s && pu.receivedAt < e).reduce((sum, pu) => sum + (pu.amount || 0), 0);
+    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), rev, cost, current: k === 5 };
+  });
+  const maxRev = Math.max(1, ...monthly.map(m => Math.max(m.rev, m.cost)));
+
+  // Best & worst sellers — excludes items flagged out of reports (Delivery etc.)
+  const perf = {};
+  periodOrders.forEach(o => o.items.filter(inReports).forEach(i => {
+    const lt = i.lineTotal !== undefined ? i.lineTotal : i.qty * i.unitPrice;
+    if (!perf[i.name]) perf[i.name] = { name: i.name, revenue: 0, qty: 0, weight: i.unitType === 'weight' };
+    perf[i.name].revenue += lt;
+    perf[i.name].qty += i.qty;
+  }));
+  const perfRows = Object.values(perf).sort((a, b) => b.revenue - a.revenue);
+  const maxPerf = perfRows.length ? perfRows[0].revenue : 1;
+  const topRows = perfRows.slice(0, 5);
+  const bottomRows = perfRows.length > 6 ? perfRows.slice(-3) : [];
+
+  const byCat = {};
+  periodPurchases.forEach(pu => { const c = pu.category || 'Other'; byCat[c] = (byCat[c] || 0) + (pu.amount || 0); });
+  const catRows = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const maxCat = catRows.length ? catRows[0][1] : 1;
+
+  $('#money-reports').innerHTML = `
+    <div class="chip-row" id="periodChips">
+      <button class="chip ${state.period === 'month' ? 'is-selected' : ''}" data-period="month">Month</button>
+      <button class="chip ${state.period === 'quarter' ? 'is-selected' : ''}" data-period="quarter">Quarter</button>
+      <button class="chip ${state.period === 'year' ? 'is-selected' : ''}" data-period="year">Year</button>
+    </div>
+    <div class="period-nav">
+      <button id="periodPrev" title="Previous">‹</button>
+      <span class="label">${per.label}</span>
+      <button id="periodNext" title="Next" ${per.off >= 0 ? 'disabled' : ''}>›</button>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card hero">
+        <div class="label">Revenue · ${per.label}</div>
+        <div class="value">${fmtMoney(revenue)}</div>
+        <div class="hint">${periodOrders.length} order${periodOrders.length === 1 ? '' : 's'}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Costs · ${per.label}</div>
+        <div class="value">${fmtMoney(costs)}</div>
+        <div class="hint">${periodPurchases.length} expense${periodPurchases.length === 1 ? '' : 's'}</div>
+      </div>
+      <div class="stat-card ${profit < 0 ? 'warn' : ''}">
+        <div class="label">Profit · ${per.label}</div>
+        <div class="value">${profit < 0 ? '−' + fmtMoney(-profit) : fmtMoney(profit)}</div>
+        <div class="hint">revenue − costs</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Stock value</div>
+        <div class="value">${fmtMoney(stockValue)}</div>
+        <div class="hint">stock × selling price</div>
+      </div>
+    </div>
+    <h2 class="section-label">Revenue vs costs · last 6 months</h2>
+    <div class="card">
+      <div class="chart">
+        ${monthly.map(m => `
+          <div class="chart-col ${m.current ? 'is-current' : ''}">
+            <span class="chart-val">${m.rev ? fmtCompact(m.rev) : ''}</span>
+            <div class="chart-bars">
+              <div class="chart-bar" style="height:${Math.round(m.rev / maxRev * 100)}%"></div>
+              <div class="chart-bar cost" style="height:${Math.round(m.cost / maxRev * 100)}%"></div>
+            </div>
+            <span class="chart-label">${m.label}</span>
+          </div>`).join('')}
+      </div>
+      <div class="chart-legend">
+        <span><span class="legend-dot rev"></span>Revenue</span>
+        <span><span class="legend-dot cost"></span>Costs</span>
+      </div>
+    </div>
+    ${catRows.length ? `
+    <h2 class="section-label">Costs by category · ${per.label}</h2>
+    <div class="card">
+      ${catRows.map(([c, amt]) => `
+        <div class="tc-row">
+          <div class="tc-name">${c}</div>
+          <div class="tc-track"><div class="tc-fill cost" style="width:${Math.max(4, Math.round(amt / maxCat * 100))}%"></div></div>
+          <div class="tc-amount">${fmtMoney(amt)}</div>
+        </div>`).join('')}
+    </div>` : ''}
+    ${topRows.length ? `
+    <h2 class="section-label">Top sellers · ${per.label}</h2>
+    <div class="card">
+      ${topRows.map(r => `
+        <div class="tc-row">
+          <div class="tc-name">${esc(r.name)}</div>
+          <div class="tc-track"><div class="tc-fill" style="width:${Math.max(4, Math.round(r.revenue / maxPerf * 100))}%"></div></div>
+          <div class="tc-amount">${fmtMoney(r.revenue)}<div class="sub" style="font-weight:400;font-size:11px;color:var(--md-on-surface-variant)">${r.weight ? fmtGrams(r.qty) : r.qty + '×'}</div></div>
+        </div>`).join('')}
+    </div>` : ''}
+    ${bottomRows.length ? `
+    <h2 class="section-label">Slowest movers · ${per.label}</h2>
+    <div class="card">
+      ${bottomRows.map(r => `
+        <div class="tc-row">
+          <div class="tc-name">${esc(r.name)}</div>
+          <div class="tc-track"><div class="tc-fill" style="width:${Math.max(4, Math.round(r.revenue / maxPerf * 100))}%"></div></div>
+          <div class="tc-amount">${fmtMoney(r.revenue)}<div class="sub" style="font-weight:400;font-size:11px;color:var(--md-on-surface-variant)">${r.weight ? fmtGrams(r.qty) : r.qty + '×'}</div></div>
+        </div>`).join('')}
+    </div>` : ''}`;
+
+  document.querySelectorAll('#periodChips [data-period]').forEach(chip =>
+    chip.addEventListener('click', () => { state.period = chip.dataset.period; state.periodOffset = 0; renderReports(); }));
+  const prev = $('#periodPrev'), next = $('#periodNext');
+  if (prev) prev.onclick = () => { state.periodOffset--; renderReports(); };
+  if (next) next.onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderReports(); } };
+}
+
+/* ----- MONEY: profit split ----- */
+/* Waterfall: base (profit or revenue) → minus tax reserve % → minus buffer
+   reserve % → remainder split between two shares. All percentages and the
+   base are configurable and stored locally. Amounts always sum exactly:
+   each step rounds the set-aside and keeps the remainder intact. */
+const SPLIT_DEFAULTS = { base: 'profit', taxPct: 7, resPct: 2.5, sharePct: 60, name1: 'Share 1', name2: 'Share 2' };
+function splitCfg() {
+  try { return { ...SPLIT_DEFAULTS, ...JSON.parse(shared.getItem('erp_split_cfg') || '{}') }; }
+  catch { return { ...SPLIT_DEFAULTS }; }
+}
+
+async function renderSplit() {
+  const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
+  const per = computePeriod();
+  const cfg = splitCfg();
+
+  const revenue = orders.filter(o => o.createdAt >= per.start && o.createdAt < per.end)
+    .reduce((s, o) => s + o.total, 0);
+  const costs = purchases.filter(pu => pu.receivedAt >= per.start && pu.receivedAt < per.end)
+    .reduce((s, pu) => s + (pu.amount || 0), 0);
+  const profit = revenue - costs;
+  const base = cfg.base === 'revenue' ? revenue : profit;
+
+  const tax = base > 0 ? Math.round(base * cfg.taxPct / 100) : 0;
+  const afterTax = base - tax;
+  const reserve = afterTax > 0 ? Math.round(afterTax * cfg.resPct / 100) : 0;
+  const toSplit = afterTax - reserve;
+  const share1 = toSplit > 0 ? Math.round(toSplit * cfg.sharePct / 100) : 0;
+  const share2 = toSplit > 0 ? toSplit - share1 : 0;
+  const fmtSigned = n => n < 0 ? '−' + fmtMoney(-n) : fmtMoney(n);
+
+  $('#money-split').innerHTML = `
+    <div class="chip-row" id="splitChips">
+      <button class="chip ${state.period === 'month' ? 'is-selected' : ''}" data-speriod="month">Month</button>
+      <button class="chip ${state.period === 'quarter' ? 'is-selected' : ''}" data-speriod="quarter">Quarter</button>
+      <button class="chip ${state.period === 'year' ? 'is-selected' : ''}" data-speriod="year">Year</button>
+    </div>
+    <div class="period-nav">
+      <button id="splitPrev" title="Previous">‹</button>
+      <span class="label">${per.label}</span>
+      <button id="splitNext" title="Next" ${per.off >= 0 ? 'disabled' : ''}>›</button>
+    </div>
+    <div class="card">
+      <div class="flow-row start">
+        <span>${cfg.base === 'revenue' ? 'Revenue' : 'Profit'} · ${per.label}</span>
+        <span>${fmtSigned(base)}</span>
+      </div>
+      <div class="flow-row minus">
+        <span>Tax reserve · ${cfg.taxPct}%</span>
+        <span>−${fmtMoney(tax)}</span>
+      </div>
+      <div class="flow-row sub">
+        <span>After tax</span>
+        <span>${fmtSigned(afterTax)}</span>
+      </div>
+      <div class="flow-row minus">
+        <span>Buffer reserve · ${cfg.resPct}%</span>
+        <span>−${fmtMoney(reserve)}</span>
+      </div>
+      <div class="flow-row sub">
+        <span>To distribute</span>
+        <span>${fmtSigned(toSplit)}</span>
+      </div>
+      <div class="flow-row share">
+        <span>${esc(cfg.name1)} · ${cfg.sharePct}%</span>
+        <span>${fmtMoney(share1)}</span>
+      </div>
+      <div class="flow-row share">
+        <span>${esc(cfg.name2)} · ${(100 - cfg.sharePct).toLocaleString(undefined, { maximumFractionDigits: 2 })}%</span>
+        <span>${fmtMoney(share2)}</span>
+      </div>
+    </div>
+    <div class="stat-grid" style="margin-top:12px">
+      <div class="stat-card warn">
+        <div class="label">Set aside · tax + buffer</div>
+        <div class="value">${fmtMoney(tax + reserve)}</div>
+        <div class="hint">park this before spending anything</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Payout total</div>
+        <div class="value">${fmtMoney(share1 + share2)}</div>
+        <div class="hint">${esc(cfg.name1)} ${fmtMoney(share1)} · ${esc(cfg.name2)} ${fmtMoney(share2)}</div>
+      </div>
+    </div>
+    ${base <= 0 ? '<div class="sub" style="font-size:13px;color:var(--md-on-surface-variant);margin-top:10px">No positive amount this period — nothing is set aside or distributed.</div>' : ''}
+    <button class="btn-tonal" id="splitSettings" style="margin-top:14px">Adjust percentages…</button>`;
+
+  document.querySelectorAll('#splitChips [data-speriod]').forEach(chip =>
+    chip.addEventListener('click', () => { state.period = chip.dataset.speriod; state.periodOffset = 0; renderSplit(); renderReports(); }));
+  $('#splitPrev').onclick = () => { state.periodOffset--; renderSplit(); renderReports(); };
+  $('#splitNext').onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderSplit(); renderReports(); } };
+  $('#splitSettings').onclick = openSplitSettings;
+}
+
+function openSplitSettings() {
+  const cfg = splitCfg();
+  openSheet(`
+    <h2>Split settings</h2>
+    <div class="form-card">
+      <label class="field"><span>Base amount</span>
+        <select id="spBase">
+          <option value="profit" ${cfg.base === 'profit' ? 'selected' : ''}>Profit (revenue − costs)</option>
+          <option value="revenue" ${cfg.base === 'revenue' ? 'selected' : ''}>Revenue</option>
+        </select>
+      </label>
+      <div class="field-row">
+        <label class="field"><span>Tax reserve (%)</span>
+          <input id="spTax" type="number" min="0" max="100" step="0.1" inputmode="decimal" value="${cfg.taxPct}">
+        </label>
+        <label class="field"><span>Buffer reserve (%)</span>
+          <input id="spRes" type="number" min="0" max="100" step="0.1" inputmode="decimal" value="${cfg.resPct}">
+        </label>
+      </div>
+      <label class="field"><span>First share (%) — the rest goes to the second share</span>
+        <input id="spShare" type="number" min="0" max="100" step="0.5" inputmode="decimal" value="${cfg.sharePct}">
+      </label>
+      <div class="field-row">
+        <label class="field"><span>Name first share</span><input id="spName1" value="${esc(cfg.name1)}"></label>
+        <label class="field"><span>Name second share</span><input id="spName2" value="${esc(cfg.name2)}"></label>
+      </div>
+      <button class="btn-filled" id="spSave">Save</button>
+    </div>`);
+  $('#spSave').onclick = () => {
+    const clampPct = v => Math.min(100, Math.max(0, Number(v) || 0));
+    shared.setItem('erp_split_cfg', JSON.stringify({
+      base: $('#spBase').value,
+      taxPct: clampPct($('#spTax').value),
+      resPct: clampPct($('#spRes').value),
+      sharePct: clampPct($('#spShare').value),
+      name1: $('#spName1').value.trim() || 'Share 1',
+      name2: $('#spName2').value.trim() || 'Share 2'
+    }));
+    closeSheet(); snack('Split settings saved'); renderSplit();
+  };
+}
+
+/* Who paid an expense. 'company' (default for old records) hits the bank
+   immediately; a person fronting money only hits the bank once reimbursed. */
+const paidByLabel = pb => {
+  const cfg = splitCfg();
+  return pb === 'p1' ? cfg.name1 : pb === 'p2' ? cfg.name2 : 'Company';
+};
+const isPersonal = p => p.paidBy === 'p1' || p.paidBy === 'p2';
+const hitsBank = p => !isPersonal(p) || p.reimbursed;
+
+/* ----- MONEY: bank balance ----- */
+/* The user anchors a real balance at a moment in time. From then on the
+   app tracks it live: baseline + order revenue since − expenses since.
+   Drift (private spending, fees) is fixed by simply re-anchoring. */
+function bankCfg() {
+  try { return JSON.parse(shared.getItem('erp_bank')) || null; } catch { return null; }
+}
+async function computeBank() {
+  const cfg = bankCfg();
+  if (!cfg) return null;
+  const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
+  const inflow = orders.filter(o => o.createdAt >= cfg.ts).reduce((s, o) => s + o.total, 0);
+  const outflow = purchases.filter(p => p.receivedAt >= cfg.ts && hitsBank(p)).reduce((s, p) => s + (p.amount || 0), 0);
+  return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases };
+}
+
+async function renderBank() {
+  const data = await computeBank();
+  if (!data) {
+    $('#money-bank').innerHTML = `
+      <div class="empty">
+        <div class="title">Track your bank balance</div>
+        <div>Set your current balance once — every order and expense you log will then move it automatically.</div>
+        <button class="btn-tonal" id="bankSetup">Set current balance</button>
+      </div>`;
+    $('#bankSetup').onclick = () => openBankSheet();
+    return;
+  }
+
+  const { cfg, inflow, outflow, balance, orders, purchases } = data;
+  // Ledger: everything that moved the balance since the baseline.
+  const moves = [];
+  orders.forEach(o => { if (o.createdAt >= cfg.ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
+  purchases.forEach(p => { if (p.receivedAt >= cfg.ts && hitsBank(p)) moves.push({ ts: p.receivedAt, text: esc(p.description) + (isPersonal(p) ? ' (reimbursed)' : ''), amt: -(p.amount || 0) }); });
+  moves.sort((a, b) => b.ts - a.ts);
+
+  $('#money-bank').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-card hero">
+        <div class="label">Bank balance (tracked)</div>
+        <div class="value">${balance < 0 ? '−' + fmtMoney(-balance) : fmtMoney(balance)}</div>
+        <div class="hint">baseline ${fmtMoney(cfg.amount)} set ${fmtDate(cfg.ts)} ${fmtTime(cfg.ts)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">In since baseline</div>
+        <div class="value">${fmtMoney(inflow)}</div>
+        <div class="hint">orders</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Out since baseline</div>
+        <div class="value">${fmtMoney(outflow)}</div>
+        <div class="hint">expenses</div>
+      </div>
+    </div>
+    <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>
+    <h2 class="section-label">Movements since baseline</h2>
+    <div class="card">
+      ${moves.slice(0, 15).map(m => `
+        <div class="flow-row" style="padding:8px 4px">
+          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.text}<span style="color:var(--md-on-surface-variant);font-size:12px"> · ${fmtDate(m.ts)}</span></span>
+          <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
+        </div>`).join('') || '<div class="empty">Nothing has moved the balance yet.</div>'}
+    </div>
+    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here, and expenses fronted personally only count once marked reimbursed — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
+
+  $('#bankUpdate').onclick = () => openBankSheet(balance);
+}
+
+function openBankSheet(prefill) {
+  const cfg = bankCfg();
+  openSheet(`
+    <h2>${cfg ? 'Update bank balance' : 'Set bank balance'}</h2>
+    <div class="form-card">
+      <label class="field"><span>Current balance (฿) — check your banking app and copy it here</span>
+        <input id="bkAmount" type="number" step="1" inputmode="numeric" value="${prefill !== undefined ? Math.round(prefill) : (cfg ? cfg.amount : '')}" placeholder="e.g. 45000">
+      </label>
+      <button class="btn-filled" id="bkSave">${cfg ? 'Re-anchor from now' : 'Start tracking'}</button>
+      ${cfg ? '<button class="btn-text danger" id="bkStop">Stop tracking balance</button>' : ''}
+      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant)">From this moment, every order adds to this number and every expense subtracts from it. Orders and expenses dated before now don't affect it.</div>
+    </div>`);
+  $('#bkSave').onclick = () => {
+    const amount = Number($('#bkAmount').value);
+    if (!Number.isFinite(amount)) return snack('Enter your current balance');
+    shared.setItem('erp_bank', JSON.stringify({ amount: Math.round(amount), ts: Date.now() }));
+    closeSheet(); snack('Bank balance anchored'); render();
+  };
+  const stop = $('#bkStop');
+  if (stop) stop.onclick = () => {
+    shared.removeItem('erp_bank');
+    closeSheet(); snack('Balance tracking stopped'); render();
+  };
+}
+
+/* ----- STOCK: outlook (moved from dashboard) ----- */
+async function renderStockOutlook() {
+  const [orders, products] = await Promise.all([DB.getAll('orders'), DB.getAll('products')]);
+  const OUTLOOK_DAYS = 90;
+  const soldSince = Date.now() - OUTLOOK_DAYS * 86400000;
+  const soldPer = {};
+  orders.forEach(o => {
+    if (o.createdAt < soldSince) return;
+    o.items.forEach(i => { soldPer[i.productId] = (soldPer[i.productId] || 0) + i.qty; });
+  });
+  const outlook = products
+    .filter(p => p.trackStock !== false && soldPer[p.id] > 0)
+    .map(p => { const perDay = soldPer[p.id] / OUTLOOK_DAYS; return { p, perMonth: perDay * 30, daysLeft: p.stock / perDay }; })
+    .sort((a, b) => a.daysLeft - b.daysLeft)
+    .slice(0, 5);
+
+  $('#stockOutlook').innerHTML = outlook.length ? `
+    <details class="section" data-sec="outlook" ${isSecOpen('outlook') ? 'open' : ''}>
+    <summary class="section-label">Stock outlook · at current sales pace</summary>
+    <div class="card" style="margin-bottom:12px">
+      ${outlook.map(x => `
+        <div class="tc-row">
+          <div class="tc-name">${esc(x.p.name)}</div>
+          <div class="tc-track"><div class="tc-fill ${x.daysLeft < 14 ? 'cost' : ''}" style="width:${Math.max(4, Math.min(100, Math.round(x.daysLeft / 60 * 100)))}%"></div></div>
+          <div class="tc-amount">${x.p.stock === 0 ? 'out now' : '~' + Math.round(x.daysLeft) + ' days'}<div class="sub" style="font-weight:400;font-size:11px;color:var(--md-on-surface-variant)">sells ${x.p.unit === 'weight' ? fmtGrams(Math.round(x.perMonth)) : Math.round(x.perMonth)}/mo</div></div>
+        </div>`).join('')}
+      <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);margin-top:6px">based on the last 90 days — amber = under 2 weeks left</div>
+    </div>
+    </details>` : '';
+  const d = $('#stockOutlook details');
+  if (d) d.addEventListener('toggle', () => localStorage.setItem('erp_sec_outlook', d.open ? '1' : '0'));
+}
+
+const SEC_DEFAULTS = { outlook: '0' };
+const isSecOpen = k => (localStorage.getItem('erp_sec_' + k) ?? SEC_DEFAULTS[k]) === '1';
 
 /* ----- Inventory: products ----- */
 // Weight-type products store stock in grams internally; show it humanized.
@@ -597,7 +1112,7 @@ async function renderProducts() {
         <div class="row">
           <div class="row-main">
             <div class="name">${esc(p.name)}</div>
-            <div class="sub">${esc(p.sku || 'No SKU')} · ${fmtMoney(p.price)} / ${p.unit === 'weight' ? 'kg' : 'unit'}</div>
+            <div class="sub">${esc(p.sku || 'No SKU')} · ${p.unit === 'weight' ? fmtMoney(p.price / 2) + ' / 500g' : fmtMoney(p.price) + ' / unit'}</div>
             ${stockBadge(p)}
           </div>
           <div class="row-end">
@@ -617,7 +1132,19 @@ async function renderProducts() {
       snack('Product deleted'); render();
     });
     card.addEventListener('click', () => openProductForm(p.id));
-    attachLongPress(card, () => openItemOptions(p.name, { onEdit: () => openProductForm(p.id), onDelete: confirmDelete }));
+    attachLongPress(card, () => {
+      openSheet(`
+        <h2>${esc(p.name)}</h2>
+        <div class="form-card">
+          ${p.trackStock !== false ? '<button class="btn-tonal" id="ioAddStock">Add stock…</button>' : ''}
+          <button class="btn-tonal" id="ioEdit">Edit</button>
+          <button class="btn-text danger" id="ioDelete">Delete</button>
+        </div>`);
+      const a = $('#ioAddStock');
+      if (a) a.onclick = () => openAddStockSheet(p);
+      $('#ioEdit').onclick = () => { closeSheet(); openProductForm(p.id); };
+      $('#ioDelete').onclick = () => { closeSheet(); confirmDelete(); };
+    });
   });
 }
 
@@ -626,32 +1153,74 @@ async function renderPurchases() {
   const purchases = await DB.getAll('purchases');
   purchases.sort((a, b) => b.receivedAt - a.receivedAt);
   const cat = p => p.category || 'Other';
-  const list = state.purchaseFilter === 'all' ? purchases : purchases.filter(p => cat(p) === state.purchaseFilter);
+  const cfg = splitCfg();
+
+  // Keep the "Paid by" dropdown labels in sync with the split names.
+  const sel = $('#poPaidBy');
+  if (sel) {
+    const cur = sel.value || 'company';
+    sel.innerHTML = `<option value="company">Company</option><option value="p1">${esc(cfg.name1)}</option><option value="p2">${esc(cfg.name2)}</option>`;
+    sel.value = cur;
+  }
+
+  // Outstanding reimbursements per person.
+  const owed = { p1: 0, p2: 0 };
+  purchases.forEach(p => { if (isPersonal(p) && !p.reimbursed) owed[p.paidBy] += (p.amount || 0); });
+  const owedTotal = owed.p1 + owed.p2;
+  $('#owedCard').innerHTML = owedTotal > 0 ? `
+    <div class="card" style="margin-top:12px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">
+      <div style="font-weight:600;margin-bottom:4px">Outstanding reimbursements · ${fmtMoney(owedTotal)}</div>
+      ${owed.p1 > 0 ? `<div class="row" style="font-size:14px"><span>${esc(cfg.name1)} fronted</span><span style="font-weight:600">${fmtMoney(owed.p1)}</span></div>` : ''}
+      ${owed.p2 > 0 ? `<div class="row" style="font-size:14px"><span>${esc(cfg.name2)} fronted</span><span style="font-weight:600">${fmtMoney(owed.p2)}</span></div>` : ''}
+      <div style="font-size:12px;opacity:.8;margin-top:6px">long-press an expense to mark it reimbursed</div>
+    </div>` : '';
+
+  let list = purchases;
+  if (state.purchaseFilter === '__owed') list = purchases.filter(p => isPersonal(p) && !p.reimbursed);
+  else if (state.purchaseFilter !== 'all') list = purchases.filter(p => cat(p) === state.purchaseFilter);
 
   $('#purchaseList').innerHTML = list.slice(0, 50).map(p => `
     <div class="swipe" data-puid="${p.id}">
-      ${SWIPE_PANES}
-      <div class="card">
+      <div class="card is-tappable">
         <div class="row">
           <div class="row-main">
             <div class="name">${esc(p.description)}</div>
             <div class="sub">${cat(p)}${p.supplier ? ' · ' + esc(p.supplier) : ''} · ${fmtDate(p.receivedAt)}</div>
+            ${isPersonal(p) ? (p.reimbursed
+              ? `<span class="badge badge-ok"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · reimbursed</span>`
+              : `<span class="badge badge-low"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · not reimbursed</span>`) : ''}
           </div>
           <div class="row-end"><div class="big">${fmtMoney(p.amount)}</div></div>
         </div>
       </div>
-    </div>`).join('') || `<div class="empty"><div class="title">No expenses found</div><div>${purchases.length ? 'Try a different category filter.' : 'Money you spend (stock, materials, equipment…) will appear here.'}</div></div>`;
+    </div>`).join('') || `<div class="empty"><div class="title">No expenses found</div><div>${purchases.length ? 'Try a different filter.' : 'Money you spend (stock, materials, equipment…) will appear here.'}</div></div>`;
 
   document.querySelectorAll('#purchaseList .swipe[data-puid]').forEach(wrap => {
     const p = purchases.find(x => x.id === Number(wrap.dataset.puid));
     const card = wrap.querySelector('.card');
-    const confirmDelete = () => showConfirm(`Delete purchase “${p.description}” (${fmtMoney(p.amount)})?`, async () => {
+    const confirmDelete = () => showConfirm(`Delete expense “${p.description}” (${fmtMoney(p.amount)})?`, async () => {
       await DB.delete('purchases', p.id);
-      snack('Purchase deleted'); render();
+      snack('Expense deleted'); render();
     });
-    card.classList.add('is-tappable');
     card.addEventListener('click', () => openPurchaseForm(p));
-    attachLongPress(card, () => openItemOptions(p.description, { onEdit: () => openPurchaseForm(p), onDelete: confirmDelete }));
+    attachLongPress(card, () => {
+      const canReimburse = isPersonal(p) && !p.reimbursed;
+      openSheet(`
+        <h2>${esc(p.description)}</h2>
+        <div class="form-card">
+          ${canReimburse ? '<button class="btn-tonal" id="ioReimburse">Mark as reimbursed</button>' : ''}
+          <button class="btn-tonal" id="ioEdit">Edit</button>
+          <button class="btn-text danger" id="ioDelete">Delete</button>
+        </div>`);
+      const r = $('#ioReimburse');
+      if (r) r.onclick = async () => {
+        p.reimbursed = true;
+        await DB.put('purchases', p);
+        closeSheet(); snack(`Reimbursed — ${paidByLabel(p.paidBy)} is paid back ${fmtMoney(p.amount)}`); render();
+      };
+      $('#ioEdit').onclick = () => { closeSheet(); openPurchaseForm(p); };
+      $('#ioDelete').onclick = () => { closeSheet(); confirmDelete(); };
+    });
   });
 
   // Prefill the log form's date with today
@@ -662,6 +1231,8 @@ const CATEGORY_OPTIONS = ['Materials', 'Packaging', 'Equipment', 'Shipping', 'Ot
 
 /* Edit an existing expense entry. */
 function openPurchaseForm(p) {
+  const cfg = splitCfg();
+  const pb = p.paidBy || 'company';
   openSheet(`
     <h2>Edit expense</h2>
     <div class="form-card">
@@ -674,10 +1245,22 @@ function openPurchaseForm(p) {
       </div>
       <div class="field-row">
         <label class="field"><span>Date</span><input type="date" id="peDate" value="${tsToDateInput(p.receivedAt)}"></label>
-        <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}"></label>
+        <label class="field"><span>Paid by</span>
+          <select id="pePaidBy">
+            <option value="company" ${pb === 'company' ? 'selected' : ''}>Company</option>
+            <option value="p1" ${pb === 'p1' ? 'selected' : ''}>${esc(cfg.name1)}</option>
+            <option value="p2" ${pb === 'p2' ? 'selected' : ''}>${esc(cfg.name2)}</option>
+          </select>
+        </label>
       </div>
+      <label class="field-checkbox" id="peReimburseWrap" ${pb === 'company' ? 'hidden' : ''}>
+        <input type="checkbox" id="peReimbursed" ${p.reimbursed ? 'checked' : ''}>
+        <span>Reimbursed — the company has paid this person back</span>
+      </label>
+      <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}"></label>
       <button class="btn-filled" id="peSave">Save changes</button>
     </div>`);
+  $('#pePaidBy').onchange = e => { $('#peReimburseWrap').hidden = e.target.value === 'company'; };
   $('#peSave').onclick = async () => {
     const description = $('#peDescription').value.trim();
     const amount = Number($('#peAmount').value);
@@ -685,8 +1268,13 @@ function openPurchaseForm(p) {
     if (!description) return snack('Enter what you bought');
     if (!(amount > 0)) return snack('Enter an amount greater than 0');
     if (!ts) return snack('Pick a date');
-    await DB.put('purchases', { ...p, description, amount, category: $('#peCategory').value, supplier: $('#peSupplier').value.trim(), receivedAt: ts });
-    closeSheet(); snack('Purchase updated'); render();
+    const paidBy = $('#pePaidBy').value;
+    await DB.put('purchases', {
+      ...p, description, amount, category: $('#peCategory').value,
+      paidBy, reimbursed: paidBy === 'company' ? false : $('#peReimbursed').checked,
+      supplier: $('#peSupplier').value.trim(), receivedAt: ts
+    });
+    closeSheet(); snack('Expense updated'); render();
   };
 }
 
@@ -698,17 +1286,57 @@ $('#poReceive').addEventListener('click', async () => {
   if (!(amount > 0)) return snack('Enter an amount greater than 0');
   if (!ts) return snack('Pick a date');
 
+  const paidBy = $('#poPaidBy').value;
   await DB.add('purchases', {
     description, amount,
     category: $('#poCategory').value,
+    paidBy, reimbursed: false,
     supplier: $('#poSupplier').value.trim(),
     receivedAt: ts
   });
   $('#poDescription').value = ''; $('#poAmount').value = ''; $('#poSupplier').value = '';
   $('#poDate').value = tsToDateInput(Date.now());
-  snack(`Logged ${fmtMoney(amount)} — ${description}`);
+  snack(paidBy === 'company'
+    ? `Logged ${fmtMoney(amount)} — ${description}`
+    : `Logged ${fmtMoney(amount)} — fronted by ${paidByLabel(paidBy)} (not reimbursed yet)`);
   render();
 });
+
+
+/* Quick stock receipt: enter how much CAME IN, not the new total. */
+function openAddStockSheet(p) {
+  const isW = p.unit === 'weight';
+  openSheet(`
+    <h2>Add stock — ${esc(p.name)}</h2>
+    <div class="form-card">
+      <div class="sub" style="color:var(--md-on-surface-variant);margin-top:-8px">Currently ${fmtStock(p)} in stock. Enter what's being added.</div>
+      ${isW ? `
+      <div class="field-row">
+        <label class="field"><span>Quantity to add</span><input id="asQty" type="number" min="0.001" step="0.001" inputmode="decimal" value="1"></label>
+        <label class="field"><span>Unit</span><select id="asUnit"><option value="kg" selected>kg</option><option value="g">g</option></select></label>
+      </div>` : `
+      <label class="field"><span>Pieces to add</span><input id="asQty" type="number" min="1" inputmode="numeric" value="1"></label>`}
+      <button class="btn-filled" id="asSave">Add to stock</button>
+    </div>`);
+  $('#asSave').onclick = async () => {
+    const raw = Number($('#asQty').value);
+    if (!(raw > 0)) return snack('Enter a quantity greater than 0');
+    const grams = isW ? ($('#asUnit').value === 'kg' ? Math.round(raw * 1000) : Math.round(raw)) : raw;
+    const fresh = await DB.get('products', p.id);
+    await DB.addStock(p.id, grams);
+    // New stock first goes to orders that were waiting for it.
+    let allocMsg = '';
+    const allocations = await DB.allocatePending(p.id);
+    if (allocations.length) {
+      const total = allocations.reduce((s, a) => s + a.qty, 0);
+      allocMsg = ` — ${isW ? fmtGrams(total) : total + ' unit' + (total === 1 ? '' : 's')} went to waiting orders`;
+    }
+    const after = await DB.get('products', p.id);
+    closeSheet();
+    snack(`Added ${isW ? fmtGrams(grams) : grams + '×'} ${fresh.name} (now ${fmtStock(after)})${allocMsg}`);
+    render();
+  };
+}
 
 /* ----- Product form ----- */
 async function openProductForm(id) {
@@ -743,7 +1371,7 @@ async function openProductForm(id) {
       <label class="field"><span>Name</span><input id="pfName" value="${esc(p.name)}" placeholder="e.g. Oak shelf 80 cm"></label>
       <div class="field-row">
         <label class="field"><span>SKU (optional)</span><input id="pfSku" value="${esc(p.sku || '')}" placeholder="OAK-80"></label>
-        <label class="field"><span id="pfPriceLabel">${unitType === 'weight' ? 'Price per kg (฿)' : 'Unit price (฿)'}</span><input id="pfPrice" type="number" min="0" step="1" inputmode="numeric" value="${p.price}"></label>
+        <label class="field"><span id="pfPriceLabel">${unitType === 'weight' ? 'Price per 500g (฿)' : 'Unit price (฿)'}</span><input id="pfPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${unitType === 'weight' ? p.price / 2 : p.price}"></label>
       </div>
       <label class="field"><span>Unit type</span>
         <select id="pfUnitType">
@@ -753,7 +1381,7 @@ async function openProductForm(id) {
       </label>
       <div id="pfPackWrap">${unitType === 'weight' ? `
         <label class="field"><span>Pack size on receipt (g) — e.g. 500 shows “(500g ฿…)”</span>
-          <input id="pfPack" type="number" min="1" inputmode="numeric" value="${p.packG || 1000}">
+          <input id="pfPack" type="number" min="1" inputmode="numeric" value="${p.packG || 500}">
         </label>` : ''}
       </div>
       <label class="field"><span>Stock handling</span>
@@ -764,14 +1392,18 @@ async function openProductForm(id) {
         </select>
       </label>
       <div id="pfStockFields">${stockFieldsHTML(unitType, tracked)}</div>
+      <label class="field-checkbox">
+        <input type="checkbox" id="pfExclude" ${p.excludeReports ? 'checked' : ''}>
+        <span>Exclude from sales reports — for shipping fees & extras that shouldn't count as a product sold</span>
+      </label>
       <button class="btn-filled" id="pfSave">${id ? 'Save changes' : 'Add product'}</button>
       ${id ? '<button class="btn-text danger" id="pfDelete">Delete product</button>' : ''}
     </div>`);
 
   function redraw() {
     $('#pfStockFields').innerHTML = stockFieldsHTML($('#pfUnitType').value, $('#pfStockMode').value === 'tracked');
-    $('#pfPriceLabel').textContent = $('#pfUnitType').value === 'weight' ? 'Price per kg (฿)' : 'Unit price (฿)';
-    const curPack = $('#pfPack') ? Number($('#pfPack').value) || 1000 : (p.packG || 1000);
+    $('#pfPriceLabel').textContent = $('#pfUnitType').value === 'weight' ? 'Price per 500g (฿)' : 'Unit price (฿)';
+    const curPack = $('#pfPack') ? Number($('#pfPack').value) || 500 : (p.packG || 500);
     $('#pfPackWrap').innerHTML = $('#pfUnitType').value === 'weight' ? `
       <label class="field"><span>Pack size on receipt (g) — e.g. 500 shows “(500g ฿…)”</span>
         <input id="pfPack" type="number" min="1" inputmode="numeric" value="${curPack}">
@@ -797,7 +1429,10 @@ async function openProductForm(id) {
 
   $('#pfSave').onclick = async () => {
     const name = $('#pfName').value.trim();
-    const price = Number($('#pfPrice').value);
+    const priceInput = Number($('#pfPrice').value);
+    // Weight products are entered per 500g but stored per kg internally,
+    // so existing orders and totals keep their exact meaning.
+    const price = $('#pfUnitType') && $('#pfUnitType').value === 'weight' ? Math.round(priceInput * 2) : priceInput;
     if (!name) return snack('Give the product a name');
     if (!(price >= 0)) return snack('Enter a valid unit price');
 
@@ -820,7 +1455,8 @@ async function openProductForm(id) {
       ...(id ? { id } : {}),
       name, sku: $('#pfSku').value.trim(), price, trackStock, stockMode: mode,
       unit: finalUnitType, stock, lowStock,
-      packG: finalUnitType === 'weight' ? Math.max(1, Number($('#pfPack') && $('#pfPack').value) || 1000) : undefined,
+      excludeReports: $('#pfExclude').checked,
+      packG: finalUnitType === 'weight' ? Math.max(1, Number($('#pfPack') && $('#pfPack').value) || 500) : undefined,
       isDelivery: p.isDelivery || false
     };
     const savedId = await DB.put('products', record);
@@ -851,7 +1487,7 @@ function railHTML(order) {
     <div class="rail">
       ${STATUSES.map((s, i) => `<div class="rail-seg ${i < idx ? 'is-done' : i === idx ? (idx === last ? 'is-done' : 'is-current') : ''}"></div>`).join('')}
     </div>
-    <div class="rail-labels"><span>Production</span><span>Ready</span><span>Completed</span><span>Delivered</span></div>
+    <div class="rail-labels"><span>Production</span><span>Ready</span><span>Shipped</span><span>Delivered</span></div>
     <div class="rail-status ${idx === last ? 'is-completed' : ''}">${order.status}</div>
     ${idx < last ? `<button class="advance-btn" data-advance="${order.id}">Mark as “${STATUSES[idx + 1]}”</button>` : ''}`;
 }
@@ -861,7 +1497,7 @@ async function renderOrders() {
   const q = state.search.order.toLowerCase();
   let list = orders.filter(o =>
     o.customerName.toLowerCase().includes(q) ||
-    String(o.id).includes(q) ||
+    String(o.seq ?? o.id).includes(q) ||
     orderNo(o).toLowerCase().includes(q) ||
     o.items.some(i => i.name.toLowerCase().includes(q)));
   if (state.statusFilter === 'open') list = list.filter(o => o.status !== 'Delivered');
@@ -938,7 +1574,7 @@ function buildReceipt(order, products) {
     const lt = i.lineTotal !== undefined ? i.lineTotal : i.qty * i.unitPrice;
     if (i.unitType === 'weight') {
       const p = products.find(x => x.id === i.productId);
-      const pack = (p && p.packG) || 1000;
+      const pack = (p && p.packG) || 500;
       const packPrice = Math.round(i.unitPrice * pack / 1000);
       return `1x ${i.name} (${pack}g ฿${fmtN(packPrice)}) = ${i.qty}g ฿${fmtN(lt)}`;
     }
@@ -952,7 +1588,7 @@ function buildReceipt(order, products) {
     ? `Total (฿${fmtN(sub)}-${order.discountPct}%) = ฿${fmtN(order.total)}`
     : `Total = ฿${fmtN(order.total)}`));
 
-  const footer = localStorage.getItem('erp_receipt_footer');
+  const footer = shared.getItem('erp_receipt_footer');
   if (footer && footer.trim()) parts.push('\n' + footer.trim());
   return parts.join('\n');
 }
@@ -970,12 +1606,196 @@ async function shareReceipt(o) {
   }
 }
 
+/* Compact searchable customer picker: replaces the native <select>, whose
+   OS popup covers the whole screen once the customer list grows. Renders a
+   small scrollable dropdown under the field instead. */
+function attachCustomerPicker({ input, drop, customers, allowNew, onPick, onType, onNew }) {
+  const render = () => {
+    const t = input.value.trim().toLowerCase();
+    const hits = customers
+      .filter(c => !t || c.name.toLowerCase().includes(t) || (c.phone || '').includes(t))
+      .slice(0, 6);
+    const exact = customers.some(c => c.name.toLowerCase() === t);
+    drop.innerHTML =
+      (allowNew && t && !exact ? `<div class="combo-item combo-new" data-new>＋ Create “${esc(input.value.trim())}” as new customer</div>` : '') +
+      hits.map(c => `<div class="combo-item" data-cid="${c.id}"><div>${esc(c.name)}</div>${c.phone ? `<div class="sub">${esc(c.phone)}</div>` : ''}</div>`).join('') +
+      (!hits.length && !allowNew ? '<div class="combo-item" style="color:var(--md-on-surface-variant)">No matching customers</div>' : '');
+    drop.hidden = false;
+    drop.querySelectorAll('[data-cid]').forEach(el => el.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      const c = customers.find(x => x.id === Number(el.dataset.cid));
+      input.value = c.name;
+      drop.hidden = true;
+      input.blur();
+      onPick(c);
+    }));
+    const n = drop.querySelector('[data-new]');
+    if (n) n.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      drop.hidden = true;
+      input.blur();
+      if (onType) onType(input.value.trim());
+      if (onNew) onNew(input.value.trim());
+    });
+  };
+  input.addEventListener('focus', render);
+  input.addEventListener('input', () => { render(); if (onType) onType(input.value.trim()); });
+  input.addEventListener('blur', () => setTimeout(() => { drop.hidden = true; }, 150));
+}
+
+/* ----- Order edit (customer, address, items, discount) ----- */
+async function openOrderEdit(o) {
+  const [products, customers] = await Promise.all([DB.getAll('products'), DB.getAll('customers')]);
+  if (!products.length) return snack('No products available');
+  products.sort((a, b) => a.name.localeCompare(b.name));
+
+  const isWeight = p => p.unit === 'weight';
+  const newLine = (p = products[0]) => ({
+    productId: p.id,
+    qty: isWeight(p) ? 1000 : 1,
+    unitPrice: p.price,
+    weightBased: isWeight(p)
+  });
+
+  // Start from the order's current items; skip items whose product was
+  // deleted since (we can't reprice or restock those sensibly).
+  let dropped = 0;
+  let lines = o.items.map(i => {
+    if (!products.find(p => p.id === i.productId)) { dropped++; return null; }
+    return { productId: i.productId, qty: i.qty, unitPrice: i.unitPrice, weightBased: i.unitType === 'weight' };
+  }).filter(Boolean);
+  if (!lines.length) lines = [newLine()];
+  if (dropped) snack(`${dropped} item(s) reference a deleted product and were left out`);
+
+  const productOptions = sel => products.map(p =>
+    `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${esc(p.name)} (${p.trackStock === false ? MODE_TAGS[stockMode(p)] : fmtStock(p) + ' left'})</option>`).join('');
+
+  openSheet(`
+    <h2>Edit ${orderNo(o)}</h2>
+    <div class="form-card">
+      <label class="field" style="position:relative"><span>Customer</span>
+        <input id="oeCustomerSearch" value="${esc(o.customerName)}" placeholder="Search customers" autocomplete="off">
+        <div class="combo-drop" id="oeCustomerDrop" hidden></div>
+      </label>
+      <label class="field"><span>Delivery address</span><input id="oeAddress" value="${esc(o.address)}"></label>
+      <h2 class="section-label" style="margin:8px 0 0">Items</h2>
+      <div id="oeLines"></div>
+      <button class="btn-tonal" id="oeAddLine">＋ Add item</button>
+      <label class="field" style="margin-top:4px"><span>Discount (%)</span>
+        <input id="oeDiscount" type="number" min="0" max="100" step="0.5" inputmode="decimal" value="${o.discountPct || 0}">
+      </label>
+      <div id="oeTotals"></div>
+      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant)">${o.skipStock ? 'This order was created without touching stock — edits leave stock alone too.' : 'Stock is adjusted automatically: removed items go back, added items are taken (or marked awaiting).'}</div>
+      <button class="btn-filled" id="oeSave">Save changes</button>
+    </div>`);
+
+  const linesEl = $('#oeLines');
+
+  function drawLines() {
+    linesEl.innerHTML = lines.map((l, i) => l.weightBased ? `
+      <div class="line-item" style="margin-bottom:2px">
+        <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
+        <label class="field"><span>Weight (g)</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
+        <label class="field"><span>฿ / 500g</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${l.unitPrice / 2}"></label>
+        <button class="remove" data-rm="${i}" title="Remove item">✕</button>
+      </div>
+      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney((l.unitPrice || 0) / 2)}/500g, rounded down)</div>` : `
+      <div class="line-item" style="margin-bottom:10px">
+        <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
+        <label class="field"><span>Qty</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
+        <label class="field"><span>Unit price (฿)</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="1" inputmode="numeric" value="${l.unitPrice}"></label>
+        <button class="remove" data-rm="${i}" title="Remove item">✕</button>
+      </div>`).join('');
+
+    linesEl.querySelectorAll('[data-li]').forEach(el => el.addEventListener('input', () => {
+      const i = Number(el.dataset.li), k = el.dataset.k;
+      lines[i][k] = (k === 'unitPrice' && lines[i].weightBased) ? Number(el.value) * 2 : Number(el.value);
+      if (k === 'productId') {
+        const p = products.find(p => p.id === lines[i].productId);
+        lines[i] = newLine(p);
+        drawLines();
+      } else if (lines[i].weightBased) {
+        const hint = el.closest('.line-item').nextElementSibling;
+        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney((lines[i].unitPrice || 0) / 2)}/500g, rounded down)`;
+      }
+      updateTotal();
+    }));
+    linesEl.querySelectorAll('[data-rm]').forEach(el => el.addEventListener('click', () => {
+      lines.splice(Number(el.dataset.rm), 1);
+      if (!lines.length) lines = [newLine()];
+      drawLines(); updateTotal();
+    }));
+    updateTotal();
+  }
+  function updateTotal() {
+    const subtotal = lines.reduce((s, l) => s + lineTotal(l), 0);
+    const pct = Math.min(100, Math.max(0, Number($('#oeDiscount').value) || 0));
+    const discount = Math.ceil(subtotal * pct / 100);
+    const total = subtotal - discount;
+    $('#oeTotals').innerHTML = pct > 0 ? `
+      <div class="order-total" style="font-weight:400;font-size:14px;color:var(--md-on-surface-variant)"><span>Subtotal</span><span>${fmtMoney(subtotal)}</span></div>
+      <div class="order-total" style="font-weight:400;font-size:14px;color:var(--md-on-surface-variant)"><span>Discount ${pct}%</span><span>−${fmtMoney(discount)}</span></div>
+      <div class="order-total"><span>Total</span><span>${fmtMoney(total)}</span></div>` : `
+      <div class="order-total"><span>Total</span><span>${fmtMoney(total)}</span></div>`;
+  }
+
+  $('#oeAddLine').onclick = () => { lines.push(newLine()); drawLines(); };
+  $('#oeDiscount').addEventListener('input', updateTotal);
+  let ePicked = customers.find(c => c.id === o.customerId) || null;
+  attachCustomerPicker({
+    input: $('#oeCustomerSearch'),
+    drop: $('#oeCustomerDrop'),
+    customers, allowNew: false,
+    onPick: c => {
+      ePicked = c;
+      if (c.address) $('#oeAddress').value = c.address;
+    }
+  });
+  // If they typed but didn't pick anyone, snap back to the last valid choice.
+  $('#oeCustomerSearch').addEventListener('blur', () => setTimeout(() => {
+    $('#oeCustomerSearch').value = ePicked ? ePicked.name : o.customerName;
+  }, 160));
+  drawLines();
+
+  $('#oeSave').onclick = async () => {
+    const customerId = ePicked ? ePicked.id : o.customerId;
+    const customer = ePicked || { id: o.customerId, name: o.customerName };
+    const address = $('#oeAddress').value.trim();
+    if (!address) return snack('Enter a delivery address');
+
+    const items = lines
+      .filter(l => l.qty > 0)
+      .map(l => {
+        const p = products.find(p => p.id === l.productId);
+        return {
+          productId: p.id, name: p.name,
+          qty: l.qty, unitPrice: l.unitPrice,
+          unitType: l.weightBased ? 'weight' : 'pcs',
+          excludeReports: !!p.excludeReports,
+          lineTotal: lineTotal(l)
+        };
+      });
+    if (!items.length) return snack('Add at least one item');
+
+    const subtotal = items.reduce((s, i) => s + i.lineTotal, 0);
+    const discountPct = Math.min(100, Math.max(0, Number($('#oeDiscount').value) || 0));
+    const total = subtotal - Math.ceil(subtotal * discountPct / 100);
+
+    await DB.updateOrderItems(o.id, {
+      customerId, customerName: customer.name, address,
+      items, subtotal, discountPct, total
+    });
+    closeSheet(); snack(`${orderNo(o)} updated`); render();
+  };
+}
+
 /* ----- Order options (long-press / swipe-edit) ----- */
 function openOrderOptions(o) {
   const hasWeight = o.items.some(i => i.unitType === 'weight');
   openSheet(`
     <h2>${orderNo(o)} · ${esc(o.customerName)}</h2>
     <div class="form-card">
+      <button class="btn-tonal" id="ooEdit">Edit order…</button>
       <button class="btn-tonal" id="ooShare">Share receipt</button>
       <button class="btn-tonal" id="ooDate">Change order date & time</button>
       <button class="btn-tonal" id="ooNumber">Change order number</button>
@@ -983,6 +1803,7 @@ function openOrderOptions(o) {
       <button class="btn-text danger" id="ooDelete">Delete order</button>
     </div>`);
 
+  $('#ooEdit').onclick = () => openOrderEdit(o);
   $('#ooShare').onclick = () => shareReceipt(o);
 
   $('#ooDate').onclick = () => {
@@ -1010,19 +1831,20 @@ function openOrderOptions(o) {
     openSheet(`
       <h2>Change order number</h2>
       <div class="form-card">
-        <label class="field"><span>New sequence number for ${orderNo(o)} (currently ${o.id})</span>
-          <input type="number" id="onNew" min="1" inputmode="numeric" value="${o.id}">
+        <label class="field"><span>New sequence number for ${orderNo(o)}</span>
+          <input type="number" id="onNew" min="1" inputmode="numeric" value="${o.seq ?? o.id}">
         </label>
         <button class="btn-filled" id="onSave">Save</button>
       </div>`);
     $('#onSave').onclick = async () => {
-      const newId = Number($('#onNew').value);
-      if (!(newId >= 1)) return snack('Enter a number of 1 or higher');
-      if (newId === o.id) return closeSheet();
-      try {
-        await DB.changeOrderId(o.id, newId);
-        closeSheet(); snack(`Order is now ${orderNo({ id: newId, createdAt: o.createdAt })}`); render();
-      } catch (err) { snack(err.message); }
+      const newSeq = Number($('#onNew').value);
+      if (!(newSeq >= 1)) return snack('Enter a number of 1 or higher');
+      if (newSeq === o.seq) return closeSheet();
+      const all = await DB.getAll('orders');
+      if (all.some(x => x.id !== o.id && x.seq === newSeq)) return snack(`Order number ${newSeq} is already in use`);
+      o.seq = newSeq;
+      await DB.put('orders', o);
+      closeSheet(); snack(`Order is now ${orderNo(o)}`); render();
     };
   };
 
@@ -1036,7 +1858,7 @@ function openOrderOptions(o) {
       <div class="form-card">
         ${weightItems.map(x => `
           <label class="field">
-            <span>${esc(x.item.name)} — actual weight (g), was ${fmtGrams(x.item.qty)} at ${fmtMoney(x.item.unitPrice)}/kg</span>
+            <span>${esc(x.item.name)} — actual weight (g), was ${fmtGrams(x.item.qty)} at ${fmtMoney(x.item.unitPrice / 2)}/500g</span>
             <input type="number" min="1" inputmode="numeric" data-widx="${x.idx}" value="${x.item.qty}">
           </label>`).join('')}
         <button class="btn-filled" id="owSave">Save weights</button>
@@ -1081,20 +1903,20 @@ async function openOrderForm() {
 
   const productOptions = sel => products.map(p =>
     `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${esc(p.name)} (${p.trackStock === false ? MODE_TAGS[stockMode(p)] : fmtStock(p) + ' left'})</option>`).join('');
-  const customerOptions = customers.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
 
   openSheet(`
     <h2>New order</h2>
     <div class="form-card">
-      <label class="field"><span>Customer</span>
-        <select id="ofCustomer"><option value="">＋ New customer</option>${customerOptions}</select>
+      <label class="field" style="position:relative"><span>Customer</span>
+        <input id="ofCustomerSearch" placeholder="Search customers, or type a new name" autocomplete="off">
+        <div class="combo-drop" id="ofCustomerDrop" hidden></div>
       </label>
-      <div id="ofNewCustomer">
+      <div id="ofNewCustomer" hidden>
+        <div class="combo-notice" id="ofNewNotice"></div>
         <div class="field-row">
-          <label class="field"><span>Customer name</span><input id="ofName" placeholder="Full name"></label>
           <label class="field"><span>Phone number</span><input id="ofPhone" type="tel" inputmode="tel" placeholder="08x-xxx-xxxx"></label>
+          <label class="field"><span>Email (optional)</span><input id="ofEmail" type="email" inputmode="email" placeholder="name@example.com"></label>
         </div>
-        <label class="field"><span>Email (optional)</span><input id="ofEmail" type="email" inputmode="email" placeholder="name@example.com"></label>
       </div>
       <label class="field"><span>Delivery address</span><input id="ofAddress" placeholder="Street, city"></label>
       <div class="field-row">
@@ -1122,10 +1944,10 @@ async function openOrderForm() {
       <div class="line-item" style="margin-bottom:2px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Weight (g)</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
-        <label class="field"><span>฿ / kg</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="1" inputmode="numeric" value="${l.unitPrice}"></label>
+        <label class="field"><span>฿ / 500g</span><input data-li="${i}" data-k="unitPrice" type="number" min="0" step="0.5" inputmode="decimal" value="${l.unitPrice / 2}"></label>
         <button class="remove" data-rm="${i}" title="Remove item">✕</button>
       </div>
-      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney(l.unitPrice || 0)}/kg, rounded down)</div>` : `
+      <div class="line-hint" style="margin-bottom:10px">= ${fmtMoney(lineTotal(l))} (${fmtGrams(l.qty || 0)} at ${fmtMoney((l.unitPrice || 0) / 2)}/500g, rounded down)</div>` : `
       <div class="line-item" style="margin-bottom:10px">
         <label class="field"><span>Product</span><select data-li="${i}" data-k="productId">${productOptions(l.productId)}</select></label>
         <label class="field"><span>Qty</span><input data-li="${i}" data-k="qty" type="number" min="1" inputmode="numeric" value="${l.qty}"></label>
@@ -1135,7 +1957,7 @@ async function openOrderForm() {
 
     linesEl.querySelectorAll('[data-li]').forEach(el => el.addEventListener('input', () => {
       const i = Number(el.dataset.li), k = el.dataset.k;
-      lines[i][k] = Number(el.value);
+      lines[i][k] = (k === 'unitPrice' && lines[i].weightBased) ? Number(el.value) * 2 : Number(el.value);
       if (k === 'productId') {           // product switched: refill price/qty/type from the product card
         const p = products.find(p => p.id === lines[i].productId);
         lines[i] = newLine(p);
@@ -1143,7 +1965,7 @@ async function openOrderForm() {
       } else if (lines[i].weightBased) {
         // live-update the computed line price under the row
         const hint = el.closest('.line-item').nextElementSibling;
-        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney(lines[i].unitPrice || 0)}/kg, rounded down)`;
+        if (hint) hint.textContent = `= ${fmtMoney(lineTotal(lines[i]))} (${fmtGrams(lines[i].qty || 0)} at ${fmtMoney((lines[i].unitPrice || 0) / 2)}/500g, rounded down)`;
       }
       updateTotal();
     }));
@@ -1171,32 +1993,54 @@ async function openOrderForm() {
   // Prefill order date & time with now (local time)
   $('#ofDate').value = tsToDateInput(Date.now());
   $('#ofTime').value = tsToTimeInput(Date.now());
-  $('#ofCustomer').onchange = async e => {
-    const id = Number(e.target.value);
-    $('#ofNewCustomer').hidden = !!id;
-    if (id) {
-      const c = customers.find(c => c.id === id);
+  let pickedCustomer = null; // null = the typed name may become a new customer
+  attachCustomerPicker({
+    input: $('#ofCustomerSearch'),
+    drop: $('#ofCustomerDrop'),
+    customers, allowNew: true,
+    onPick: c => {
+      pickedCustomer = c;
+      $('#ofNewCustomer').hidden = true;
       $('#ofAddress').value = c.address || '';
-    } else $('#ofAddress').value = '';
-  };
+    },
+    onType: name => {
+      pickedCustomer = null;
+      // Typed something that isn't an existing name → this becomes a new
+      // customer, no extra tap needed. The search field IS the name field.
+      const exact = customers.find(c => c.name.toLowerCase() === name.toLowerCase());
+      const isNew = name && !exact;
+      $('#ofNewCustomer').hidden = !isNew;
+      if (isNew) $('#ofNewNotice').textContent = `＋ “${name}” will be added as a new customer`;
+    },
+    onNew: () => $('#ofPhone').focus()
+  });
 
   $('#ofCreate').onclick = async () => {
-    let customerId = Number($('#ofCustomer').value) || null;
-    let customerName;
+    const typed = $('#ofCustomerSearch').value.trim();
     const address = $('#ofAddress').value.trim();
     if (!address) return snack('Enter a delivery address');
 
-    if (customerId) {
-      customerName = customers.find(c => c.id === customerId).name;
+    let customerId, customerName;
+    if (pickedCustomer && typed === pickedCustomer.name) {
+      customerId = pickedCustomer.id;
+      customerName = pickedCustomer.name;
     } else {
-      customerName = $('#ofName').value.trim();
-      const phone = $('#ofPhone').value.trim();
-      if (!customerName) return snack('Enter the customer name');
-      if (!phone) return snack('Enter a phone number');
-      customerId = await DB.add('customers', {
-        name: customerName, phone, email: $('#ofEmail').value.trim(),
-        address, createdAt: Date.now()
-      });
+      if (!typed) return snack('Enter or pick a customer');
+      // Typed exactly an existing name without tapping it? Use that customer
+      // instead of creating a duplicate.
+      const exact = customers.find(c => c.name.toLowerCase() === typed.toLowerCase());
+      if (exact) {
+        customerId = exact.id;
+        customerName = exact.name;
+      } else {
+        const phone = $('#ofPhone').value.trim();
+        if (!phone) return snack('Enter a phone number for the new customer');
+        customerName = typed;
+        customerId = await DB.add('customers', {
+          name: customerName, phone, email: $('#ofEmail').value.trim(),
+          address, createdAt: Date.now()
+        });
+      }
     }
 
     const items = lines
@@ -1208,6 +2052,7 @@ async function openOrderForm() {
           qty: l.qty,                                   // grams for weight items, pieces otherwise
           unitPrice: l.unitPrice,                       // per kg for weight items
           unitType: l.weightBased ? 'weight' : 'pcs',
+          excludeReports: !!p.excludeReports,
           lineTotal: lineTotal(l)
         };
       });
@@ -1227,18 +2072,20 @@ async function openOrderForm() {
       customerId, customerName, address, items,
       subtotal, discountPct,
       total: subtotal - discount,
-      status: STATUSES[0], createdAt, statusChangedAt: null
+      status: STATUSES[0], createdAt, statusChangedAt: null,
+      seq: await nextOrderSeq()
     };
 
     try {
       const deduct = $('#ofDeduct').checked;
       const orderId = await DB.createOrderWithStock(order, deduct);
+      shared.setItem('erp_order_seq_next', String(order.seq + 1)); // commit the number only on success
       closeSheet();
       const waiting = order.items.filter(i => i.pendingQty > 0);
       if (waiting.length) {
-        snack(`${orderNo({ id: orderId, createdAt: order.createdAt })} created — awaiting stock: ${waiting.map(i => itemLabel(i, i.pendingQty)).join(', ')}`);
+        snack(`${orderNo(order)} created — awaiting stock: ${waiting.map(i => itemLabel(i, i.pendingQty)).join(', ')}`);
       } else {
-        snack(`${orderNo({ id: orderId, createdAt: order.createdAt })} created — in production`);
+        snack(`${orderNo(order)} created — in production`);
       }
       render();
     } catch (err) {
@@ -1375,6 +2222,10 @@ function syncStockChips() {
   document.querySelectorAll('[data-stockfilter]').forEach(c =>
     c.classList.toggle('is-selected', c.dataset.stockfilter === state.stockFilter));
 }
+function syncStatusChips() {
+  document.querySelectorAll('[data-status]').forEach(c =>
+    c.classList.toggle('is-selected', c.dataset.status === state.statusFilter));
+}
 document.querySelectorAll('[data-stockfilter]').forEach(chip =>
   chip.addEventListener('click', () => { state.stockFilter = chip.dataset.stockfilter; syncStockChips(); renderProducts(); }));
 
@@ -1388,17 +2239,19 @@ document.querySelectorAll('[data-pcat]').forEach(chip =>
 document.querySelectorAll('[data-status]').forEach(chip =>
   chip.addEventListener('click', () => {
     state.statusFilter = chip.dataset.status;
-    document.querySelectorAll('[data-status]').forEach(c => c.classList.toggle('is-selected', c === chip));
+    syncStatusChips();
     renderOrders();
   }));
 
-document.querySelectorAll('[data-invtab]').forEach(tab =>
+document.querySelectorAll('[data-moneytab]').forEach(tab =>
   tab.addEventListener('click', () => {
-    state.invTab = tab.dataset.invtab;
-    document.querySelectorAll('[data-invtab]').forEach(t => t.classList.toggle('is-active', t === tab));
-    $('#inv-stock').hidden = state.invTab !== 'stock';
-    $('#inv-purchases').hidden = state.invTab !== 'purchases';
-    $('#fab').hidden = state.invTab === 'purchases';
+    state.moneyTab = tab.dataset.moneytab;
+    document.querySelectorAll('[data-moneytab]').forEach(t => t.classList.toggle('is-active', t === tab));
+    $('#money-reports').hidden = state.moneyTab !== 'reports';
+    $('#money-bank').hidden = state.moneyTab !== 'bank';
+    $('#money-split').hidden = state.moneyTab !== 'split';
+    $('#money-expenses').hidden = state.moneyTab !== 'expenses';
+    $('#fab').hidden = true; // money view has no FAB
   }));
 
 /* ---------------- Sample data ---------------- */
@@ -1419,7 +2272,7 @@ async function seedSampleData() {
   await DB.add('orders', {
     customerId: c1, customerName: 'Maren Holt', address: '14 Birch Lane, Riverton',
     items: [{ productId: pids[0], name: 'Oak shelf 80 cm', qty: 2, unitPrice: 89 }],
-    total: 178, status: 'Completed', createdAt: Date.now() - day * 12, statusChangedAt: Date.now() - day * 8
+    total: 178, status: 'Shipped', createdAt: Date.now() - day * 12, statusChangedAt: Date.now() - day * 8
   });
   await DB.add('orders', {
     customerId: c2, customerName: 'Tobias Lind', address: '3 Harbor St, Eastport',
@@ -1442,15 +2295,16 @@ async function seedSampleData() {
 // Runs once ever (tracked via localStorage, not IndexedDB, since it's just
 // an app-setup flag). Safe for both brand-new and already-in-use databases.
 async function ensureDeliveryProduct() {
-  if (localStorage.getItem('erp_delivery_seeded')) return;
+  if (shared.getItem('erp_delivery_seeded')) return;
   const products = await DB.getAll('products');
   if (!products.some(p => p.isDelivery)) {
     await DB.add('products', {
       name: 'Delivery', sku: 'DELIVERY', price: 99,
-      stock: 0, lowStock: 0, trackStock: false, isDelivery: true
+      stock: 0, lowStock: 0, trackStock: false, stockMode: 'service',
+      excludeReports: true, isDelivery: true
     });
   }
-  localStorage.setItem('erp_delivery_seeded', '1');
+  shared.setItem('erp_delivery_seeded', '1');
 }
 
 /* ---------------- PWA: service worker ---------------- */
@@ -1458,5 +2312,37 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
 }
 
+/* ---------------- Live sync ---------------- */
+/* Changes from another device (or a sync landing after being offline)
+   re-render the current view. Batched so a burst of changes renders once. */
+let syncRenderTimer = null;
+DB.onChange(() => {
+  clearTimeout(syncRenderTimer);
+  syncRenderTimer = setTimeout(render, 150);
+});
+
 /* ---------------- Boot ---------------- */
-ensureDeliveryProduct().then(() => switchView('dashboard'));
+/* One-off data migrations, safe to run repeatedly. */
+async function ensureMigrations() {
+  // Status rename: Completed -> Shipped (idempotent)
+  const orders = await DB.getAll('orders');
+  for (const o of orders) {
+    if (o.status === 'Completed') { o.status = 'Shipped'; await DB.put('orders', o); }
+  }
+  // Weight pack size: old default 1000g becomes the new 500g default (once)
+  if (!shared.getItem('erp_pack500')) {
+    const products = await DB.getAll('products');
+    for (const p of products) {
+      if (p.unit === 'weight' && (!p.packG || p.packG === 1000)) {
+        p.packG = 500;
+        await DB.put('products', p);
+      }
+    }
+    shared.setItem('erp_pack500', '1');
+  }
+}
+
+Cloud.start();
+Cloud.ready
+  .then(() => Promise.all([ensureDeliveryProduct(), ensureOrderSeq(), ensureMigrations()]))
+  .then(() => switchView('home'));

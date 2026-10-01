@@ -1,12 +1,16 @@
-/* Service worker — caches the entire app shell so BuddyBoard
-   runs with zero network. Bump CACHE version when files change. */
-const CACHE = 'buddyboard-v20';
+/* Service worker — caches the entire app shell so BuddyBoard opens with
+   zero network. Data sync goes to Supabase directly (never cached
+   here). Bump CACHE (matches BUILD in app.js) when files change. */
+const CACHE = 'buddyboard-2.0.0';
 const SHELL = [
   './',
   './index.html',
   './styles.css',
+  './supabase-config.js',
   './db.js',
+  './cloud.js',
   './app.js',
+  './vendor/supabase.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -25,9 +29,10 @@ self.addEventListener('activate', e => {
   );
 });
 
-// Cache-first: the app never needs the network after install.
+// Cache-first for the app's own files only; everything else (Supabase
+// sign-in and database traffic) goes straight to the network.
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
+  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== self.location.origin) return;
   e.respondWith(
     caches.match(e.request, { ignoreSearch: true }).then(hit => hit || fetch(e.request))
   );
