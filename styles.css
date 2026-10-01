@@ -582,3 +582,5 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   #printArea .num { text-align: right; white-space: nowrap; }
   #printArea .total td { font-weight: 700; border-top: 1pt solid #000; border-bottom: none; }
 }
+.sheet-sub { margin: -8px 0 14px; font-size: 13.5px; color: var(--md-on-surface-variant); }
+.sheet-actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
