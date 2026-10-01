@@ -59,6 +59,13 @@ create policy "team only" on public.applied_ops
   for all to authenticated using (public.is_team()) with check (public.is_team());
 -- (team has no policies: nobody can read or change it from the app.)
 
+-- Table access for signed-in users (needed when "Automatically expose new
+-- tables" is off; row-level security above still decides which rows).
+grant select, insert, update, delete on public.records to authenticated;
+grant select, insert on public.applied_ops to authenticated;
+revoke all on public.records, public.applied_ops, public.team from anon;
+revoke all on public.team from authenticated;
+
 -- Apply a batch of changes from one device in ONE transaction: either
 -- all of them land (e.g. an order + its stock deduction) or none do.
 -- Stock changes are increments, so two devices changing the same
