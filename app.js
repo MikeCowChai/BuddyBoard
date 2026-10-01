@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.3.0';
+const BUILD = '2.4.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -59,6 +59,18 @@ const $ = sel => document.querySelector(sel);
 /* Settings shared by every device (stored in the cloud, see db.js) — same
    interface as localStorage so call sites read the same. Per-device
    preferences (theme, collapsed sections) stay in localStorage. */
+/* Admin vs member (see supabase/schema.sql → team). Members do the daily
+   work; the profit split, payouts, bank balance, receipt footer, paying
+   back expenses, imports and renumbering are for the admin. The database
+   enforces this too — hiding the buttons is just so nobody hits a wall. */
+const isAdmin = () => Cloud.isAdmin();
+const ADMIN_NOTE = '<span class="admin-note">admin only</span>';
+function requireAdmin() {
+  if (isAdmin()) return true;
+  snack('Only the admin can change this');
+  return false;
+}
+
 const shared = {
   getItem: k => DB.setting(k),
   setItem: (k, v) => DB.setSetting(k, String(v)),
@@ -178,16 +190,16 @@ function openSettings() {
 
     <h2 class="section-label">Finance</h2>
     <div class="card set-card">
-      <button class="set-row" id="setBank">
+      <button class="set-row" id="setBank" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
-          <div class="set-title">Bank balance</div>
+          <div class="set-title">Bank balance ${isAdmin() ? '' : ADMIN_NOTE}</div>
           <div class="set-sub">${bank ? 'baseline set ' + fmtDate(bank.ts) : 'not set up yet'}</div>
         </div>
         <span class="set-chevron">›</span>
       </button>
-      <button class="set-row" id="setSplit">
+      <button class="set-row" id="setSplit" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
-          <div class="set-title">Profit split percentages</div>
+          <div class="set-title">Profit split percentages ${isAdmin() ? '' : ADMIN_NOTE}</div>
           <div class="set-sub">tax, buffer and share distribution</div>
         </div>
         <span class="set-chevron">›</span>
@@ -196,9 +208,9 @@ function openSettings() {
 
     <h2 class="section-label">Receipts</h2>
     <div class="card set-card">
-      <button class="set-row" id="setFooter">
+      <button class="set-row" id="setFooter" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
-          <div class="set-title">Receipt footer</div>
+          <div class="set-title">Receipt footer ${isAdmin() ? '' : ADMIN_NOTE}</div>
           <div class="set-sub">${(shared.getItem('erp_receipt_footer') || '').trim() ? 'configured' : 'name & bank account for receipts'}</div>
         </div>
         <span class="set-chevron">›</span>
@@ -214,17 +226,17 @@ function openSettings() {
         </div>
         <span class="set-chevron">›</span>
       </button>
-      <button class="set-row" id="stImport">
+      <button class="set-row" id="stImport" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
-          <div class="set-title">Import backup…</div>
+          <div class="set-title">Import backup… ${isAdmin() ? '' : ADMIN_NOTE}</div>
           <div class="set-sub">replaces everything in this app</div>
         </div>
         <span class="set-chevron">›</span>
       </button>
       <input type="file" id="stImportFile" accept=".json,application/json" hidden>
-      <button class="set-row" id="stRenumber">
+      <button class="set-row" id="stRenumber" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
-          <div class="set-title">Renumber orders</div>
+          <div class="set-title">Renumber orders ${isAdmin() ? '' : ADMIN_NOTE}</div>
           <div class="set-sub">clean up order numbers into 1, 2, 3… by date</div>
         </div>
         <span class="set-chevron">›</span>
@@ -235,7 +247,7 @@ function openSettings() {
       <button class="set-row" id="stSignOut">
         <div class="set-main">
           <div class="set-title">Sign out</div>
-          <div class="set-sub">signed in as ${esc(Cloud.email())}</div>
+          <div class="set-sub">signed in as ${esc(Cloud.email())} · ${isAdmin() ? 'admin' : 'member'}</div>
         </div>
         <span class="set-chevron">›</span>
       </button>
@@ -253,6 +265,7 @@ function openSettings() {
   $('#setFooter').onclick = () => openFooterSheet();
   $('#stSignOut').onclick = () => showConfirm('Sign out of BuddyBoard on this device?', () => Cloud.signOut(), 'Sign out');
   $('#stRenumber').onclick = () => {
+    if (!requireAdmin()) return;
     showConfirm(
       'Renumber all orders into a clean 1, 2, 3… sequence, ordered by their order date? This changes the DNBB number shown on every order.',
       async () => { const n = await renumberAllOrders(); snack(`Renumbered ${n} orders`); render(); },
@@ -281,7 +294,7 @@ function openSettings() {
     snack('Backup exported');
   };
 
-  $('#stImport').onclick = () => $('#stImportFile').click();
+  $('#stImport').onclick = () => { if (requireAdmin()) $('#stImportFile').click(); };
   $('#stImportFile').onchange = async e => {
     const f = e.target.files[0];
     e.target.value = '';
@@ -312,6 +325,7 @@ function openSettings() {
 }
 
 function openFooterSheet() {
+  if (!requireAdmin()) return;
   const footer = shared.getItem('erp_receipt_footer') || '';
   openSheet(`
     <h2>Receipt footer</h2>
@@ -993,6 +1007,7 @@ function splitDueAllTime(orders, purchases) {
 }
 
 function recordPayout(kind, amount, per) {
+  if (!requireAdmin()) return;
   const verb = isShareKind(kind) ? `Paid ${payoutLabel(kind)}` : `${payoutLabel(kind)} set aside`;
   showConfirm(
     `${verb}: ${fmtMoney(amount)} for ${per.label}?${isShareKind(kind) ? ' This comes off the bank balance today.' : ''}`,
@@ -1005,6 +1020,7 @@ function recordPayout(kind, amount, per) {
 }
 
 function openBufferWithdraw(available) {
+  if (!requireAdmin()) return;
   openSheet(`
     <h2>Take money from the buffer</h2>
     <p class="sheet-sub">In the buffer now: ${fmtMoney(available)}</p>
@@ -1043,7 +1059,8 @@ async function renderSplit() {
     const list = paidHere[kind], paid = list.reduce((t, x) => t + x.amount, 0), left = due[kind] - paid;
     const done = isShareKind(kind) ? 'Paid' : 'Set aside';
     if (due[kind] <= 0 && !paid) return '';
-    if (left <= 0) return `<button class="pay-status is-done" data-undo="${kind}">✓ ${done} ${fmtMoney(paid)} · ${fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
+    if (left <= 0) return `<button class="pay-status is-done" ${isAdmin() ? `data-undo="${kind}"` : 'disabled'}>✓ ${done} ${fmtMoney(paid)} · ${fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
+    if (!isAdmin()) return `<span class="pay-status is-open">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}${fmtMoney(left)} not ${isShareKind(kind) ? 'paid' : 'set aside'} yet</span>`;
     return `<button class="pay-status" data-pay="${kind}" data-amount="${left}">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}Mark ${fmtMoney(left)} ${isShareKind(kind) ? 'paid' : 'set aside'}</button>`;
   };
 
@@ -1132,19 +1149,19 @@ async function renderSplit() {
         <span class="tot-main">${fmtMoney(tot.tax)} <small>set aside</small></span>
         <span class="tot-open ${openAmt('tax') ? 'is-open' : ''}">${openAmt('tax') ? fmtMoney(openAmt('tax')) + ' still to set aside' : 'all set aside'}</span>
       </div>
-      <button class="btn-tonal" id="bufferTake" ${inBuffer > 0 ? '' : 'disabled'}>Take from buffer…</button>
+      ${isAdmin() ? `<button class="btn-tonal" id="bufferTake" ${inBuffer > 0 ? '' : 'disabled'}>Take from buffer…</button>` : ''}
       <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);margin-top:8px">“Still to pay” adds up every month's split up to today. Paid-out shares come off the bank balance; tax and buffer stay company money.</div>
     </div>
     ${history.length ? `
     <h2 class="section-label">Recent payouts</h2>
     <div class="card">
       ${history.map(x => `
-        <button class="flow-row payout-row" data-payout="${x.id}">
+        <button class="flow-row payout-row" data-payout="${x.id}" ${isAdmin() ? '' : 'disabled'}>
           <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${fmtDate(x.paidAt)}</small></span>
           <span>${x.withdrawal ? '−' : ''}${fmtMoney(x.amount)}</span>
         </button>`).join('')}
     </div>` : ''}
-    <button class="btn-tonal" id="splitSettings" style="margin-top:14px">Adjust percentages…</button>`;
+    ${isAdmin() ? '<button class="btn-tonal" id="splitSettings" style="margin-top:14px">Adjust percentages…</button>' : '<div class="admin-hint">Only the admin can mark payouts or change the percentages.</div>'}`;
 
   document.querySelectorAll('[data-pay]').forEach(b => b.onclick = () => recordPayout(b.dataset.pay, Number(b.dataset.amount), per));
   document.querySelectorAll('[data-undo]').forEach(b => b.onclick = () => {
@@ -1160,16 +1177,17 @@ async function renderSplit() {
       await DB.delete('payouts', x.id); snack('Record deleted'); render();
     });
   });
-  $('#bufferTake').onclick = () => openBufferWithdraw(inBuffer);
+  if ($('#bufferTake')) $('#bufferTake').onclick = () => openBufferWithdraw(inBuffer);
 
   document.querySelectorAll('#splitChips [data-speriod]').forEach(chip =>
     chip.addEventListener('click', () => { state.period = chip.dataset.speriod; state.periodOffset = 0; renderSplit(); renderReports(); }));
   $('#splitPrev').onclick = () => { state.periodOffset--; renderSplit(); renderReports(); };
   $('#splitNext').onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderSplit(); renderReports(); } };
-  $('#splitSettings').onclick = openSplitSettings;
+  if ($('#splitSettings')) $('#splitSettings').onclick = openSplitSettings;
 }
 
 function openSplitSettings() {
+  if (!requireAdmin()) return;
   const cfg = splitCfg();
   openSheet(`
     <h2>Split settings</h2>
@@ -1232,6 +1250,7 @@ const bankOutflowSince = (purchases, payouts, ts) =>
 /* Mark expenses as paid back by the company — from now on they count
    against the bank balance, dated today. */
 async function markReimbursed(list) {
+  if (!requireAdmin()) return;
   const now = Date.now();
   for (const p of list) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: now });
 }
@@ -1259,9 +1278,9 @@ async function renderBank() {
       <div class="empty">
         <div class="title">Track your bank balance</div>
         <div>Set your current balance once — every order and expense you log will then move it automatically.</div>
-        <button class="btn-tonal" id="bankSetup">Set current balance</button>
+        ${isAdmin() ? '<button class="btn-tonal" id="bankSetup">Set current balance</button>' : '<div class="admin-hint">The admin can set this up.</div>'}
       </div>`;
-    $('#bankSetup').onclick = () => openBankSheet();
+    if ($('#bankSetup')) $('#bankSetup').onclick = () => openBankSheet();
     return;
   }
 
@@ -1299,7 +1318,7 @@ async function renderBank() {
         <div class="hint">expenses, pay-backs, profit shares</div>
       </div>
     </div>
-    <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>
+    ${isAdmin() ? '<button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>' : ''}
     <h2 class="section-label">Movements since baseline</h2>
     <div class="card">
       ${moves.slice(0, 15).map(m => `
@@ -1310,10 +1329,11 @@ async function renderBank() {
     </div>
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
-  $('#bankUpdate').onclick = () => openBankSheet(balance);
+  if ($('#bankUpdate')) $('#bankUpdate').onclick = () => openBankSheet(balance);
 }
 
 function openBankSheet(prefill) {
+  if (!requireAdmin()) return;
   const cfg = bankCfg();
   openSheet(`
     <h2>${cfg ? 'Update bank balance' : 'Set bank balance'}</h2>
@@ -1463,9 +1483,9 @@ async function renderPurchases() {
       ${['p1', 'p2'].filter(k => owed[k] > 0).map(k => `
         <div class="row owed-row" style="font-size:14px">
           <span>${esc(k === 'p1' ? cfg.name1 : cfg.name2)} fronted <b>${fmtMoney(owed[k])}</b></span>
-          <button class="btn-tonal owed-pay" data-payback="${k}">Pay back</button>
+          ${isAdmin() ? `<button class="btn-tonal owed-pay" data-payback="${k}">Pay back</button>` : ''}
         </div>`).join('')}
-      <div style="font-size:12px;opacity:.8;margin-top:6px">“Pay back” when the company has transferred the money — it then comes off the bank balance. To pay back a single expense, tap it in the list.</div>
+      <div style="font-size:12px;opacity:.8;margin-top:6px">${isAdmin() ? '“Pay back” when the company has transferred the money — it then comes off the bank balance. To pay back a single expense, tap it in the list.' : 'The admin marks these as paid back once the company has transferred the money.'}</div>
     </div>` : '';
   document.querySelectorAll('[data-payback]').forEach(btn => btn.onclick = () => {
     const who = btn.dataset.payback;
@@ -1506,7 +1526,7 @@ async function renderPurchases() {
       snack('Expense deleted'); render();
     });
     const openOptions = () => {
-      const canReimburse = isPersonal(p) && !p.reimbursed;
+      const canReimburse = isPersonal(p) && !p.reimbursed && isAdmin();
       openSheet(`
         <h2>${esc(p.description)}</h2>
         <p class="sheet-sub">${fmtMoney(p.amount)} · ${esc(cat(p))} · ${fmtDate(p.receivedAt)}${isPersonal(p) ? ` · paid by ${esc(paidByLabel(p.paidBy))}${p.reimbursed ? ', paid back' : ''}` : ''}</p>
@@ -1557,8 +1577,8 @@ function openPurchaseForm(p) {
         </label>
       </div>
       <label class="field-checkbox" id="peReimburseWrap" ${pb === 'company' ? 'hidden' : ''}>
-        <input type="checkbox" id="peReimbursed" ${p.reimbursed ? 'checked' : ''}>
-        <span>Reimbursed — the company has paid this person back</span>
+        <input type="checkbox" id="peReimbursed" ${p.reimbursed ? 'checked' : ''} ${isAdmin() ? '' : 'disabled'}>
+        <span>Reimbursed — the company has paid this person back ${isAdmin() ? '' : ADMIN_NOTE}</span>
       </label>
       <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}" placeholder="e.g. Northline Supply"></label>
       <button class="btn-filled" id="peSave">${isNew ? 'Log expense' : 'Save changes'}</button>

@@ -10,6 +10,7 @@ const Cloud = (() => {
   let resolveReady;
   const ready = new Promise(r => { resolveReady = r; });
   const USER_KEY = 'bb_user';
+  const ROLE_KEY = 'bb_role'; // 'admin' | 'member', remembered for offline starts
 
   const gate = () => document.getElementById('login');
   function showGate(html) {
@@ -51,28 +52,39 @@ const Cloud = (() => {
     };
   }
 
-  /* Checks the account is on the team (supabase/schema.sql → team). */
-  async function checkTeam() {
-    const { data, error } = await sb.rpc('is_team');
-    if (error) throw error;
-    return data === true;
+  /* This account's role from the team list (supabase/schema.sql → team):
+     'admin', 'member', or null when not on the team. A database that has
+     no roles yet (before upgrade-2.4.0-roles.sql) treats everyone as admin. */
+  async function fetchRole() {
+    const { data, error } = await sb.rpc('my_role');
+    if (!error) return data || null;
+    if (error.code !== 'PGRST202' && !/my_role/.test(error.message || '')) throw error;
+    const team = await sb.rpc('is_team');
+    if (team.error) throw team.error;
+    return team.data === true ? 'admin' : null;
+  }
+  function setRole(role) {
+    const changed = localStorage.getItem(ROLE_KEY) !== role;
+    localStorage.setItem(ROLE_KEY, role);
+    if (changed && typeof render === 'function') render();
   }
 
   async function afterSignIn(email, fresh) {
     if (fresh) {
       showGate('<p class="login-sub">Loading…</p>');
-      let ok;
-      try { ok = await checkTeam(); } catch (err) {
+      let role;
+      try { role = await fetchRole(); } catch (err) {
         showLogin('Could not reach the server: ' + (err.message || err));
         return;
       }
-      if (!ok) {
+      if (!role) {
         await sb.auth.signOut();
         showLogin(`${email} has no access to this BuddyBoard. Add it to the team list in Supabase (see SETUP.md).`);
         return;
       }
       if (localStorage.getItem(USER_KEY) !== email) await DB.wipeLocal(); // another account's copy
       localStorage.setItem(USER_KEY, email);
+      setRole(role);
       await DB.connect(sb, { onError: syncError });
     } else {
       // Signed in before: open straight from the device copy, sync in the background.
@@ -87,7 +99,10 @@ const Cloud = (() => {
   /* Reconnect the stored session; offline, try again once back online. */
   async function resumeSession(email) {
     const { data } = await sb.auth.getSession().catch(() => ({ data: {} }));
-    if (data && data.session) return DB.connect(sb, { onError: syncError });
+    if (data && data.session) {
+      fetchRole().then(role => { if (role) setRole(role); }).catch(() => {});
+      return DB.connect(sb, { onError: syncError });
+    }
     if (!navigator.onLine) {
       window.addEventListener('online', () => resumeSession(email), { once: true });
       return;
@@ -97,7 +112,9 @@ const Cloud = (() => {
 
   function syncError(err) {
     const msg = String(err.message || err);
-    if (err.code === '42501' || /JWT|not on the BuddyBoard team|permission/i.test(msg)) {
+    if (/admin only/i.test(msg)) {
+      snack('Only the admin can change that — your change was undone');
+    } else if (err.code === '42501' || /JWT|not on the BuddyBoard team|permission/i.test(msg)) {
       snack('Sync refused — sign out and sign in again, or check the team list in Supabase');
     } else {
       snack('Sync problem: ' + msg);
@@ -206,6 +223,7 @@ const Cloud = (() => {
     }
     await sb.auth.signOut().catch(() => {});
     localStorage.removeItem(USER_KEY);
+    localStorage.removeItem(ROLE_KEY);
     await DB.wipeLocal();
     location.reload();
   }
@@ -214,6 +232,8 @@ const Cloud = (() => {
     ready,
     start,
     email: () => localStorage.getItem(USER_KEY) || '',
+    role: () => localStorage.getItem(ROLE_KEY) || 'admin',
+    isAdmin: () => (localStorage.getItem(ROLE_KEY) || 'admin') === 'admin',
     signOut
   };
 })();
