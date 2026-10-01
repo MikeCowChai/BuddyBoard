@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.4.0';
+const BUILD = '2.5.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -2212,6 +2212,7 @@ async function openOrderForm() {
           <label class="field"><span>Phone number</span><input id="ofPhone" type="tel" inputmode="tel" placeholder="08x-xxx-xxxx"></label>
           <label class="field"><span>Email (optional)</span><input id="ofEmail" type="email" inputmode="email" placeholder="name@example.com"></label>
         </div>
+        ${referrerFieldHTML('of')}
       </div>
       <label class="field"><span>Delivery address</span><input id="ofAddress" placeholder="Street, city"></label>
       <div class="field-row">
@@ -2224,6 +2225,7 @@ async function openOrderForm() {
       <label class="field" style="margin-top:4px"><span>Discount (%)</span>
         <input id="ofDiscount" type="number" min="0" max="100" step="1" inputmode="numeric" value="0" placeholder="0">
       </label>
+      <div class="field-hint" id="ofDiscountHint" hidden></div>
       <div id="ofTotals"></div>
       <label class="field-checkbox">
         <input type="checkbox" id="ofDeduct" checked>
@@ -2289,6 +2291,21 @@ async function openOrderForm() {
   $('#ofDate').value = tsToDateInput(Date.now());
   $('#ofTime').value = tsToTimeInput(Date.now());
   let pickedCustomer = null; // null = the typed name may become a new customer
+  // A customer's standard discount is filled in when they are picked.
+  let autoDiscount = null;
+  const setAutoDiscount = c => {
+    const pct = c && c.discountPct > 0 ? c.discountPct : 0;
+    if (pct) {
+      $('#ofDiscount').value = pct;
+      $('#ofDiscountHint').textContent = `${c.name}'s standard discount: ${pct}%`;
+    } else if (autoDiscount !== null && Number($('#ofDiscount').value) === autoDiscount) {
+      $('#ofDiscount').value = 0; // undo a discount we filled in for a previous pick
+    }
+    $('#ofDiscountHint').hidden = !pct;
+    autoDiscount = pct || null;
+    $('#ofDiscount').dispatchEvent(new Event('input'));
+  };
+  const getOrderReferrer = attachReferrerField('of', [...customers].sort((a, b) => a.name.localeCompare(b.name)));
   attachCustomerPicker({
     input: $('#ofCustomerSearch'),
     drop: $('#ofCustomerDrop'),
@@ -2297,9 +2314,11 @@ async function openOrderForm() {
       pickedCustomer = c;
       $('#ofNewCustomer').hidden = true;
       $('#ofAddress').value = c.address || '';
+      setAutoDiscount(c);
     },
     onType: name => {
       pickedCustomer = null;
+      if (autoDiscount !== null) setAutoDiscount(null);
       // Typed something that isn't an existing name → this becomes a new
       // customer, no extra tap needed. The search field IS the name field.
       const exact = customers.find(c => c.name.toLowerCase() === name.toLowerCase());
@@ -2330,10 +2349,12 @@ async function openOrderForm() {
       } else {
         const phone = $('#ofPhone').value.trim();
         if (!phone) return snack('Enter a phone number for the new customer');
+        const referredBy = getOrderReferrer();
+        if (referredBy === undefined) return snack('Pick “Referred by” from the list, or leave it empty');
         customerName = typed;
         customerId = await DB.add('customers', {
           name: customerName, phone, email: $('#ofEmail').value.trim(),
-          address, createdAt: Date.now()
+          address, createdAt: Date.now(), referredBy: referredBy || undefined
         });
       }
     }
@@ -2397,9 +2418,11 @@ async function renderCustomers() {
   const q = state.search.customer.toLowerCase();
   // Spending overview: top 5 customers as horizontal bars (clearer than a
   // pie on a narrow screen), based on all customers, not the search filter.
+  const nameOf = id => (customers.find(x => x.id === id) || {}).name;
   const all = customers.map(c => {
     const theirOrders = orders.filter(o => o.customerId === c.id);
-    return { ...c, orderCount: theirOrders.length, spent: theirOrders.reduce((s, o) => s + o.total, 0) };
+    return { ...c, orderCount: theirOrders.length, spent: theirOrders.reduce((s, o) => s + o.total, 0),
+      via: nameOf(c.referredBy), brought: referralsOf(customers, c.id).length };
   });
   const top = [...all].sort((a, b) => b.spent - a.spent).filter(c => c.spent > 0).slice(0, 5);
   const grand = all.reduce((s, c) => s + c.spent, 0);
@@ -2427,6 +2450,11 @@ async function renderCustomers() {
           <div class="row-main">
             <div class="name">${esc(c.name)}</div>
             <div class="sub">${esc(c.phone || 'No phone on file')}</div>
+            ${c.via || c.brought || c.discountPct > 0 ? `<div class="ref-tags">
+              ${c.via ? `<span class="ref-tag">via ${esc(c.via)}</span>` : ''}
+              ${c.brought ? `<span class="ref-tag is-star">★ brought ${c.brought}</span>` : ''}
+              ${c.discountPct > 0 ? `<span class="ref-tag">${c.discountPct}% off</span>` : ''}
+            </div>` : ''}
           </div>
           <div class="row-end">
             <div class="big">${fmtMoney(c.spent)}</div>
@@ -2445,18 +2473,39 @@ async function renderCustomers() {
 }
 
 async function openCustomerDetail(id) {
-  const [c, orders] = await Promise.all([DB.get('customers', id), DB.getAll('orders')]);
+  const [c, orders, customers] = await Promise.all([DB.get('customers', id), DB.getAll('orders'), DB.getAll('customers')]);
   const theirs = orders.filter(o => o.customerId === id).sort((a, b) => b.createdAt - a.createdAt);
   const spent = theirs.reduce((s, o) => s + o.total, 0);
+  const spentBy = cid => orders.filter(o => o.customerId === cid).reduce((s, o) => s + o.total, 0);
+  const referrer = customers.find(x => x.id === c.referredBy);
+  const brought = referralsOf(customers, id).sort((a, b) => spentBy(b.id) - spentBy(a.id));
+  const chain = referralChain(customers, id);
+  const chainRevenue = [...chain].reduce((s, cid) => s + spentBy(cid), 0);
   openSheet(`
     <h2>${esc(c.name)}</h2>
     <div class="sub" style="color:var(--md-on-surface-variant);margin:-8px 0 2px">${esc(c.phone || 'No phone on file')}${c.email ? ' · ' + esc(c.email) : ''}</div>
     <div class="sub" style="color:var(--md-on-surface-variant);margin:0 0 16px">${esc(c.address || 'No address on file')}</div>
     ${c.notes ? `<div class="card" style="margin-bottom:16px;background:var(--md-secondary-container);color:var(--md-on-secondary-container);font-size:14px">${esc(c.notes)}</div>` : ''}
+    ${referrer || c.discountPct > 0 ? `<div class="chip-row" style="padding:0;margin:0 0 14px">
+      ${referrer ? `<button class="chip ref-chip" data-open-customer="${referrer.id}">via ${esc(referrer.name)} ›</button>` : ''}
+      ${c.discountPct > 0 ? `<span class="chip is-selected">${c.discountPct}% standard discount</span>` : ''}
+    </div>` : ''}
     <div class="stat-grid">
       <div class="stat-card"><div class="label">Total spent</div><div class="value" style="font-size:24px">${fmtMoney(spent)}</div></div>
       <div class="stat-card"><div class="label">Orders</div><div class="value" style="font-size:24px">${theirs.length}</div></div>
     </div>
+    ${brought.length ? `
+    <h2 class="section-label">Brought in ${brought.length} customer${brought.length === 1 ? '' : 's'}</h2>
+    <div class="card">
+      ${brought.map(r => `
+        <button class="flow-row ref-row" data-open-customer="${r.id}">
+          <span>${esc(r.name)}${referralsOf(customers, r.id).length ? `<small> · brought ${referralsOf(customers, r.id).length} more</small>` : ''}</span>
+          <span>${fmtMoney(spentBy(r.id))} ›</span>
+        </button>`).join('')}
+      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);padding:8px 4px 2px">
+        ${chain.size > brought.length ? `${chain.size} customers in total through ${esc(c.name)} (incl. their referrals) · ` : ''}${fmtMoney(chainRevenue)} revenue from referrals
+      </div>
+    </div>` : ''}
     <h2 class="section-label">Order history</h2>
     <div class="card-list">
       ${theirs.map(o => `
@@ -2477,14 +2526,51 @@ async function openCustomerDetail(id) {
     </div>`);
 
   $('#cdEdit').onclick = () => openCustomerForm(id);
+  document.querySelectorAll('[data-open-customer]').forEach(b => b.onclick = () => openCustomerDetail(Number(b.dataset.openCustomer)));
   $('#cdDelete').onclick = () => showConfirm(`Delete customer “${c.name}”? Their past orders stay in the order list.`, async () => {
     await DB.delete('customers', id);
     closeSheet(); snack('Customer deleted'); render();
   });
 }
 
+/* ----- Referrals: which customer brought in which ----- */
+/* customer.referredBy = id of the customer who sent them. */
+const referralsOf = (customers, id) => customers.filter(c => c.referredBy === id);
+// Everyone brought in by id, directly or further down the chain.
+function referralChain(customers, id, seen = new Set()) {
+  referralsOf(customers, id).forEach(c => { if (!seen.has(c.id)) { seen.add(c.id); referralChain(customers, c.id, seen); } });
+  return seen;
+}
+const referrerFieldHTML = (prefix, current) => `
+  <label class="field" style="position:relative"><span>Referred by (optional)</span>
+    <input id="${prefix}Ref" value="${esc(current ? current.name : '')}" placeholder="Search the customer who sent them" autocomplete="off">
+    <div class="combo-drop" id="${prefix}RefDrop" hidden></div>
+  </label>`;
+/* Wires the field; returns a getter → customer id, null (empty) or
+   undefined (typed a name that isn't a customer). */
+function attachReferrerField(prefix, customers, initialId) {
+  const input = $(`#${prefix}Ref`);
+  let picked = initialId ?? null;
+  attachCustomerPicker({
+    input, drop: $(`#${prefix}RefDrop`), customers, allowNew: false,
+    onPick: c => { picked = c.id; }, onType: () => { picked = null; }
+  });
+  return () => {
+    const v = input.value.trim();
+    if (!v) return null;
+    if (picked) return picked;
+    const exact = customers.find(c => c.name.toLowerCase() === v.toLowerCase());
+    return exact ? exact.id : undefined;
+  };
+}
+
 async function openCustomerForm(id) {
   const c = id ? await DB.get('customers', id) : { name: '', phone: '', email: '', address: '', notes: '' };
+  const all = await DB.getAll('customers');
+  // Can't be referred by yourself or by someone you brought in.
+  const blocked = id ? referralChain(all, id, new Set([id])) : new Set();
+  const candidates = all.filter(x => !blocked.has(x.id)).sort((a, b) => a.name.localeCompare(b.name));
+  const referrer = all.find(x => x.id === c.referredBy);
   openSheet(`
     <h2>${id ? 'Edit customer' : 'New customer'}</h2>
     <div class="form-card">
@@ -2492,19 +2578,29 @@ async function openCustomerForm(id) {
       <label class="field"><span>Phone number</span><input id="cfPhone" type="tel" inputmode="tel" value="${esc(c.phone || '')}" placeholder="08x-xxx-xxxx"></label>
       <label class="field"><span>Email (optional)</span><input id="cfEmail" type="email" inputmode="email" value="${esc(c.email || '')}" placeholder="name@example.com"></label>
       <label class="field"><span>Address</span><input id="cfAddress" value="${esc(c.address || '')}"></label>
+      ${referrerFieldHTML('cf', referrer)}
+      <label class="field"><span>Standard discount (%) — filled in automatically on their new orders</span>
+        <input id="cfDiscount" type="number" min="0" max="100" step="1" inputmode="numeric" value="${c.discountPct || ''}" placeholder="0">
+      </label>
       <label class="field"><span>Notes (optional)</span><textarea id="cfNotes" rows="3" placeholder="e.g. prefers extra spicy, always ships to office">${esc(c.notes || '')}</textarea></label>
       <button class="btn-filled" id="cfSave">${id ? 'Save changes' : 'Add customer'}</button>
     </div>`);
+  const getReferrer = attachReferrerField('cf', candidates, c.referredBy);
   $('#cfSave').onclick = async () => {
     const name = $('#cfName').value.trim();
     const phone = $('#cfPhone').value.trim();
     if (!name) return snack('Enter the customer name');
     if (!phone) return snack('Enter a phone number');
+    const referredBy = getReferrer();
+    if (referredBy === undefined) return snack('Pick “Referred by” from the list, or leave it empty');
+    const discountPct = Math.min(100, Math.max(0, Number($('#cfDiscount').value) || 0));
     await DB.put('customers', {
-      ...(id ? { id } : {}), name, phone,
+      ...c, ...(id ? { id } : {}), name, phone,
       email: $('#cfEmail').value.trim(),
       address: $('#cfAddress').value.trim(),
       notes: $('#cfNotes').value.trim(),
+      referredBy: referredBy || undefined,
+      discountPct: discountPct || undefined,
       createdAt: c.createdAt || Date.now()
     });
     closeSheet(); snack(id ? 'Customer saved' : 'Customer added'); render();
