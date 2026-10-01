@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.1.0';
+const BUILD = '2.2.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -80,7 +80,7 @@ const tsToTimeInput = ts => fmtTime(ts);
    ever used, so editing it (even once, even by mistake) can make every
    later order jump to a huge number. seq has no such trap — it's just a
    number in a field, safe to reassign freely. */
-const orderNo = o => `DNBB${String(new Date(o.createdAt).getFullYear()).slice(-2)}${String(o.seq ?? o.id).padStart(4, '0')}`;
+const orderNo = o => `DNBB${String(new Date(o.createdAt).getFullYear()).slice(-2)}${(Number.isFinite(o.seq) ? String(o.seq).padStart(4, '0') : '----')}`;
 
 /* One-time self-heal: assigns clean sequential seq numbers (1, 2, 3…) to
    every order by creation date, and fixes the counter. Runs once ever;
@@ -336,8 +336,8 @@ const FAB_CONFIG = {
   home:      { label: 'Order',    action: () => openOrderForm() },
   orders:    { label: 'Order',    action: () => openOrderForm() },
   stock:     { label: 'Product',  action: () => openProductForm() },
-  customers: { label: 'Customer', action: () => openCustomerForm() }
-  // money: FAB depends on sub-tab, handled below
+  customers: { label: 'Customer', action: () => openCustomerForm() },
+  money:     { label: 'Expense',  action: () => openPurchaseForm() }
 };
 
 function switchView(view) {
@@ -349,7 +349,6 @@ function switchView(view) {
 
   const fab = $('#fab');
   let cfg = FAB_CONFIG[view];
-  if (view === 'money' && state.moneyTab === 'expenses') cfg = null; // expenses has its own inline form
   fab.hidden = !cfg;
   if (cfg) { $('#fabLabel').textContent = cfg.label; fab.onclick = cfg.action; }
 
@@ -1291,8 +1290,7 @@ async function renderProducts() {
       await DB.delete('products', p.id);
       snack('Product deleted'); render();
     });
-    card.addEventListener('click', () => openProductForm(p.id));
-    attachLongPress(card, () => {
+    const openOptions = () => {
       openSheet(`
         <h2>${esc(p.name)}</h2>
         <div class="form-card">
@@ -1304,7 +1302,9 @@ async function renderProducts() {
       if (a) a.onclick = () => openAddStockSheet(p);
       $('#ioEdit').onclick = () => { closeSheet(); openProductForm(p.id); };
       $('#ioDelete').onclick = () => { closeSheet(); confirmDelete(); };
-    });
+    };
+    card.addEventListener('click', openOptions);
+    attachLongPress(card, openOptions);
   });
 }
 
@@ -1315,13 +1315,6 @@ async function renderPurchases() {
   const cat = p => p.category || 'Other';
   const cfg = splitCfg();
 
-  // Keep the "Paid by" dropdown labels in sync with the split names.
-  const sel = $('#poPaidBy');
-  if (sel) {
-    const cur = sel.value || 'company';
-    sel.innerHTML = `<option value="company">Company</option><option value="p1">${esc(cfg.name1)}</option><option value="p2">${esc(cfg.name2)}</option>`;
-    sel.value = cur;
-  }
 
   // Outstanding reimbursements per person.
   const owed = { p1: 0, p2: 0 };
@@ -1335,7 +1328,7 @@ async function renderPurchases() {
           <span>${esc(k === 'p1' ? cfg.name1 : cfg.name2)} fronted <b>${fmtMoney(owed[k])}</b></span>
           <button class="btn-tonal owed-pay" data-payback="${k}">Pay back</button>
         </div>`).join('')}
-      <div style="font-size:12px;opacity:.8;margin-top:6px">“Pay back” when the company has transferred the money — it then comes off the bank balance. Single expenses: long-press → Mark as reimbursed.</div>
+      <div style="font-size:12px;opacity:.8;margin-top:6px">“Pay back” when the company has transferred the money — it then comes off the bank balance. To pay back a single expense, tap it in the list.</div>
     </div>` : '';
   document.querySelectorAll('[data-payback]').forEach(btn => btn.onclick = () => {
     const who = btn.dataset.payback;
@@ -1375,13 +1368,13 @@ async function renderPurchases() {
       await DB.delete('purchases', p.id);
       snack('Expense deleted'); render();
     });
-    card.addEventListener('click', () => openPurchaseForm(p));
-    attachLongPress(card, () => {
+    const openOptions = () => {
       const canReimburse = isPersonal(p) && !p.reimbursed;
       openSheet(`
         <h2>${esc(p.description)}</h2>
+        <p class="sheet-sub">${fmtMoney(p.amount)} · ${esc(cat(p))} · ${fmtDate(p.receivedAt)}${isPersonal(p) ? ` · paid by ${esc(paidByLabel(p.paidBy))}${p.reimbursed ? ', paid back' : ''}` : ''}</p>
         <div class="form-card">
-          ${canReimburse ? '<button class="btn-tonal" id="ioReimburse">Mark as reimbursed</button>' : ''}
+          ${canReimburse ? `<button class="btn-tonal" id="ioReimburse">Pay back ${esc(paidByLabel(p.paidBy))} ${fmtMoney(p.amount)}</button>` : ''}
           <button class="btn-tonal" id="ioEdit">Edit</button>
           <button class="btn-text danger" id="ioDelete">Delete</button>
         </div>`);
@@ -1392,25 +1385,26 @@ async function renderPurchases() {
       };
       $('#ioEdit').onclick = () => { closeSheet(); openPurchaseForm(p); };
       $('#ioDelete').onclick = () => { closeSheet(); confirmDelete(); };
-    });
+    };
+    card.addEventListener('click', openOptions);
+    attachLongPress(card, openOptions);
   });
-
-  // Prefill the log form's date with today
-  if (!$('#poDate').value) $('#poDate').value = tsToDateInput(Date.now());
 }
 
 const CATEGORY_OPTIONS = ['Materials', 'Packaging', 'Equipment', 'Shipping', 'Other'];
 
-/* Edit an existing expense entry. */
+/* Log a new expense (no argument) or edit an existing one. */
 function openPurchaseForm(p) {
+  const isNew = !p;
+  if (isNew) p = { description: '', amount: '', category: 'Materials', paidBy: 'company', supplier: '', receivedAt: Date.now() };
   const cfg = splitCfg();
   const pb = p.paidBy || 'company';
   openSheet(`
-    <h2>Edit expense</h2>
+    <h2>${isNew ? 'Log an expense' : 'Edit expense'}</h2>
     <div class="form-card">
-      <label class="field"><span>What did you buy</span><input id="peDescription" value="${esc(p.description)}"></label>
+      <label class="field"><span>What did you buy</span><input id="peDescription" value="${esc(p.description)}" placeholder="e.g. Sand 10kg"></label>
       <div class="field-row">
-        <label class="field"><span>Amount spent (฿)</span><input id="peAmount" type="number" min="0" step="1" inputmode="numeric" value="${p.amount}"></label>
+        <label class="field"><span>Amount spent (฿)</span><input id="peAmount" type="number" min="0" step="1" inputmode="numeric" value="${p.amount}" placeholder="100"></label>
         <label class="field"><span>Category</span>
           <select id="peCategory">${CATEGORY_OPTIONS.map(c => `<option value="${c}" ${(p.category || 'Other') === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
         </label>
@@ -1429,10 +1423,11 @@ function openPurchaseForm(p) {
         <input type="checkbox" id="peReimbursed" ${p.reimbursed ? 'checked' : ''}>
         <span>Reimbursed — the company has paid this person back</span>
       </label>
-      <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}"></label>
-      <button class="btn-filled" id="peSave">Save changes</button>
+      <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}" placeholder="e.g. Northline Supply"></label>
+      <button class="btn-filled" id="peSave">${isNew ? 'Log expense' : 'Save changes'}</button>
     </div>`);
   $('#pePaidBy').onchange = e => { $('#peReimburseWrap').hidden = e.target.value === 'company'; };
+  if (isNew && matchMedia('(pointer: fine)').matches) $('#peDescription').focus();
   $('#peSave').onclick = async () => {
     const description = $('#peDescription').value.trim();
     const amount = Number($('#peAmount').value);
@@ -1449,34 +1444,13 @@ function openPurchaseForm(p) {
       paidBy, reimbursed, reimbursedAt,
       supplier: $('#peSupplier').value.trim(), receivedAt: ts
     });
-    closeSheet(); snack('Expense updated'); render();
+    closeSheet();
+    snack(!isNew ? 'Expense updated'
+      : paidBy === 'company' ? `Logged ${fmtMoney(amount)} — ${description}`
+      : `Logged ${fmtMoney(amount)} — fronted by ${paidByLabel(paidBy)}${reimbursed ? ', already paid back' : ' (not paid back yet)'}`);
+    render();
   };
 }
-
-$('#poReceive').addEventListener('click', async () => {
-  const description = $('#poDescription').value.trim();
-  const amount = Number($('#poAmount').value);
-  const ts = dateInputToTs($('#poDate').value);
-  if (!description) return snack('Enter what you bought');
-  if (!(amount > 0)) return snack('Enter an amount greater than 0');
-  if (!ts) return snack('Pick a date');
-
-  const paidBy = $('#poPaidBy').value;
-  await DB.add('purchases', {
-    description, amount,
-    category: $('#poCategory').value,
-    paidBy, reimbursed: false,
-    supplier: $('#poSupplier').value.trim(),
-    receivedAt: ts
-  });
-  $('#poDescription').value = ''; $('#poAmount').value = ''; $('#poSupplier').value = '';
-  $('#poDate').value = tsToDateInput(Date.now());
-  snack(paidBy === 'company'
-    ? `Logged ${fmtMoney(amount)} — ${description}`
-    : `Logged ${fmtMoney(amount)} — fronted by ${paidByLabel(paidBy)} (not reimbursed yet)`);
-  render();
-});
-
 
 /* Quick stock receipt: enter how much CAME IN, not the new total. */
 function openAddStockSheet(p) {
@@ -1724,17 +1698,6 @@ async function renderOrders() {
 }
 
 /* Small long-press menu: Edit / Delete. */
-function openItemOptions(title, { onEdit, onDelete }) {
-  openSheet(`
-    <h2>${esc(title)}</h2>
-    <div class="form-card">
-      <button class="btn-tonal" id="ioEdit">Edit</button>
-      <button class="btn-text danger" id="ioDelete">Delete</button>
-    </div>`);
-  $('#ioEdit').onclick = () => { closeSheet(); onEdit(); };
-  $('#ioDelete').onclick = () => { closeSheet(); onDelete(); };
-}
-
 /* ----- Receipt sharing ----- */
 /* Format (per the owner's spec):
    1x Chili Sticks (500g ฿995) = 1850g ฿3.680     ← weight item, pack reference
@@ -2007,7 +1970,7 @@ function openOrderOptions(o) {
       <h2>Change order number</h2>
       <div class="form-card">
         <label class="field"><span>New sequence number for ${orderNo(o)}</span>
-          <input type="number" id="onNew" min="1" inputmode="numeric" value="${o.seq ?? o.id}">
+          <input type="number" id="onNew" min="1" inputmode="numeric" value="${o.seq ?? ''}">
         </label>
         <button class="btn-filled" id="onSave">Save</button>
       </div>`);
@@ -2319,12 +2282,8 @@ async function renderCustomers() {
   document.querySelectorAll('#customerList .swipe[data-cid]').forEach(wrap => {
     const c = list.find(x => x.id === Number(wrap.dataset.cid));
     const card = wrap.querySelector('.card');
-    const confirmDelete = () => showConfirm(`Delete customer “${c.name}”? Their past orders stay in the order list.`, async () => {
-      await DB.delete('customers', c.id);
-      snack('Customer deleted'); render();
-    });
     card.addEventListener('click', () => openCustomerDetail(c.id));
-    attachLongPress(card, () => openItemOptions(c.name, { onEdit: () => openCustomerForm(c.id), onDelete: confirmDelete }));
+    attachLongPress(card, () => openCustomerDetail(c.id));
   });
 }
 
@@ -2355,9 +2314,16 @@ async function openCustomerDetail(id) {
           </div>
         </div>`).join('') || '<div class="empty">No orders yet.</div>'}
     </div>
-    <button class="btn-text" id="cdEdit" style="margin-top:12px">Edit customer</button>`);
+    <div class="sheet-actions">
+      <button class="btn-tonal" id="cdEdit">Edit customer</button>
+      <button class="btn-text danger" id="cdDelete">Delete</button>
+    </div>`);
 
   $('#cdEdit').onclick = () => openCustomerForm(id);
+  $('#cdDelete').onclick = () => showConfirm(`Delete customer “${c.name}”? Their past orders stay in the order list.`, async () => {
+    await DB.delete('customers', id);
+    closeSheet(); snack('Customer deleted'); render();
+  });
 }
 
 async function openCustomerForm(id) {
@@ -2426,7 +2392,6 @@ document.querySelectorAll('[data-moneytab]').forEach(tab =>
     $('#money-bank').hidden = state.moneyTab !== 'bank';
     $('#money-split').hidden = state.moneyTab !== 'split';
     $('#money-expenses').hidden = state.moneyTab !== 'expenses';
-    $('#fab').hidden = true; // money view has no FAB
   }));
 
 /* ---------------- Sample data ---------------- */
@@ -2461,6 +2426,7 @@ async function seedSampleData() {
     total: 55, status: 'In production', createdAt: Date.now() - 3600000, statusChangedAt: null
   });
   await DB.add('purchases', { description: 'Oak boards, 10 units', amount: 340, supplier: 'Northline Timber', receivedAt: Date.now() - day * 3 });
+  await ensureOrderSeq(); // give the sample orders proper order numbers
 
   snack('Sample data loaded');
   render();

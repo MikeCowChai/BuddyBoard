@@ -72,50 +72,7 @@
     <div id="money-bank" hidden></div>
     <div id="money-split" hidden></div>
     <div id="money-expenses" hidden>
-      <div class="card form-card">
-        <h2 class="card-title">Log an expense</h2>
-        <label class="field">
-          <span>What did you buy</span>
-          <input type="text" id="poDescription" placeholder="e.g. Sand 10kg">
-        </label>
-        <div class="field-row">
-          <label class="field">
-            <span>Amount spent (฿)</span>
-            <input type="number" id="poAmount" min="0" step="1" inputmode="numeric" placeholder="100">
-          </label>
-          <label class="field">
-            <span>Category</span>
-            <select id="poCategory">
-              <option value="Materials">Materials</option>
-              <option value="Packaging">Packaging</option>
-              <option value="Equipment">Equipment</option>
-              <option value="Shipping">Shipping</option>
-              <option value="Other">Other</option>
-            </select>
-          </label>
-        </div>
-        <div class="field-row">
-          <label class="field">
-            <span>Date</span>
-            <input type="date" id="poDate">
-          </label>
-          <label class="field">
-            <span>Paid by</span>
-            <select id="poPaidBy">
-              <option value="company">Company</option>
-              <option value="p1">Person 1</option>
-              <option value="p2">Person 2</option>
-            </select>
-          </label>
-        </div>
-        <label class="field">
-          <span>Supplier (optional)</span>
-          <input type="text" id="poSupplier" placeholder="e.g. Northline Supply">
-        </label>
-        <button class="btn-filled" id="poReceive">Log expense</button>
-      </div>
       <div id="owedCard"></div>
-      <h2 class="section-label">Recent expenses</h2>
       <div class="chip-row" id="purchaseChips">
         <button class="chip is-selected" data-pcat="all">All</button>
         <button class="chip" data-pcat="__owed">Not reimbursed</button>
