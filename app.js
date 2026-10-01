@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.2.0';
+const BUILD = '2.3.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -551,8 +551,8 @@ const inReports = i => !i.excludeReports;
 
 /* ----- HOME (slim: current status only) ----- */
 async function renderHome() {
-  const [orders, products, purchases] = await Promise.all([
-    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases')
+  const [orders, products, purchases, payouts] = await Promise.all([
+    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases'), DB.getAll('payouts')
   ]);
 
   const empty = !orders.length && !products.length;
@@ -589,7 +589,7 @@ async function renderHome() {
   let bankBalance = null;
   if (bank) {
     const inflow = orders.filter(o => o.createdAt >= bank.ts).reduce((s, o) => s + o.total, 0);
-    const outflow = bankOutflowSince(purchases, bank.ts);
+    const outflow = bankOutflowSince(purchases, payouts, bank.ts);
     bankBalance = bank.amount + inflow - outflow;
   }
 
@@ -963,8 +963,67 @@ function computeSplit(revenue, costs, cfg = splitCfg()) {
   return { base, tax, afterTax, reserve, toSplit, share1, share2 };
 }
 
+/* ----- Split payouts: recording that a share was paid, or that tax/buffer
+   money was set aside. One record per payment:
+   { kind: 'tax'|'buffer'|'share1'|'share2', amount, periodStart, periodEnd,
+     periodLabel, paidAt, withdrawal? (buffer money taken back out), note? } */
+const PAYOUT_KINDS = ['tax', 'buffer', 'share1', 'share2'];
+const payoutLabel = kind => {
+  const cfg = splitCfg();
+  return { tax: 'Tax reserve', buffer: 'Buffer', share1: cfg.name1, share2: cfg.name2 }[kind];
+};
+const isShareKind = kind => kind === 'share1' || kind === 'share2';
+const splitAmounts = sp => ({ tax: sp.tax, buffer: sp.reserve, share1: sp.share1, share2: sp.share2 });
+
+/* What the split says per kind, summed month by month from the first order
+   or expense up to and including this month (each month split on its own). */
+function splitDueAllTime(orders, purchases) {
+  const first = Math.min(...orders.map(o => o.createdAt), ...purchases.map(p => p.receivedAt));
+  const due = { tax: 0, buffer: 0, share1: 0, share2: 0 };
+  if (!isFinite(first)) return due;
+  const cfg = splitCfg(), now = new Date();
+  for (let d = new Date(new Date(first).getFullYear(), new Date(first).getMonth(), 1); d <= now; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) {
+    const s = d.getTime(), e = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+    const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((t, o) => t + o.total, 0);
+    const cost = purchases.filter(p => p.receivedAt >= s && p.receivedAt < e).reduce((t, p) => t + (p.amount || 0), 0);
+    const a = splitAmounts(computeSplit(rev, cost, cfg));
+    PAYOUT_KINDS.forEach(k => { due[k] += a[k]; });
+  }
+  return due;
+}
+
+function recordPayout(kind, amount, per) {
+  const verb = isShareKind(kind) ? `Paid ${payoutLabel(kind)}` : `${payoutLabel(kind)} set aside`;
+  showConfirm(
+    `${verb}: ${fmtMoney(amount)} for ${per.label}?${isShareKind(kind) ? ' This comes off the bank balance today.' : ''}`,
+    async () => {
+      await DB.add('payouts', { kind, amount, periodStart: per.start, periodEnd: per.end, periodLabel: per.label, paidAt: Date.now() });
+      snack(`${verb} — ${fmtMoney(amount)}`); render();
+    },
+    isShareKind(kind) ? 'Mark paid' : 'Mark set aside'
+  );
+}
+
+function openBufferWithdraw(available) {
+  openSheet(`
+    <h2>Take money from the buffer</h2>
+    <p class="sheet-sub">In the buffer now: ${fmtMoney(available)}</p>
+    <div class="form-card">
+      <label class="field"><span>Amount (฿)</span><input id="bwAmount" type="number" min="1" step="1" inputmode="numeric"></label>
+      <label class="field"><span>What for (optional)</span><input id="bwNote" placeholder="e.g. new machine"></label>
+      <button class="btn-filled" id="bwSave">Take from buffer</button>
+    </div>`);
+  $('#bwSave').onclick = async () => {
+    const amount = Math.round(Number($('#bwAmount').value));
+    if (!(amount > 0)) return snack('Enter an amount greater than 0');
+    const now = Date.now();
+    await DB.add('payouts', { kind: 'buffer', withdrawal: true, amount, note: $('#bwNote').value.trim(), periodStart: now, periodEnd: now, periodLabel: fmtDate(now), paidAt: now });
+    closeSheet(); snack(`Took ${fmtMoney(amount)} from the buffer`); render();
+  };
+}
+
 async function renderSplit() {
-  const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
+  const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
   const per = computePeriod();
   const cfg = splitCfg();
 
@@ -972,8 +1031,30 @@ async function renderSplit() {
     .reduce((s, o) => s + o.total, 0);
   const costs = purchases.filter(pu => pu.receivedAt >= per.start && pu.receivedAt < per.end)
     .reduce((s, pu) => s + (pu.amount || 0), 0);
-  const { base, tax, afterTax, reserve, toSplit, share1, share2 } = computeSplit(revenue, costs, cfg);
+  const sp = computeSplit(revenue, costs, cfg);
+  const { base, tax, afterTax, reserve, toSplit, share1, share2 } = sp;
   const fmtSigned = n => n < 0 ? '−' + fmtMoney(-n) : fmtMoney(n);
+
+  // Paid / set aside for this period (payouts recorded for it or for a part of it).
+  const due = splitAmounts(sp);
+  const inPeriod = x => !x.withdrawal && x.periodStart >= per.start && x.periodEnd <= per.end;
+  const paidHere = Object.fromEntries(PAYOUT_KINDS.map(k => [k, payouts.filter(x => x.kind === k && inPeriod(x))]));
+  const status = kind => {
+    const list = paidHere[kind], paid = list.reduce((t, x) => t + x.amount, 0), left = due[kind] - paid;
+    const done = isShareKind(kind) ? 'Paid' : 'Set aside';
+    if (due[kind] <= 0 && !paid) return '';
+    if (left <= 0) return `<button class="pay-status is-done" data-undo="${kind}">✓ ${done} ${fmtMoney(paid)} · ${fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
+    return `<button class="pay-status" data-pay="${kind}" data-amount="${left}">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}Mark ${fmtMoney(left)} ${isShareKind(kind) ? 'paid' : 'set aside'}</button>`;
+  };
+
+  // All-time totals.
+  const allDue = splitDueAllTime(orders, purchases);
+  const sum = (kind, w = false) => payouts.filter(x => x.kind === kind && !!x.withdrawal === w).reduce((t, x) => t + x.amount, 0);
+  const tot = Object.fromEntries(PAYOUT_KINDS.map(k => [k, sum(k)]));
+  const withdrawn = sum('buffer', true);
+  const inBuffer = tot.buffer - withdrawn;
+  const openAmt = k => Math.max(0, allDue[k] - tot[k]);
+  const history = payouts.slice().sort((a, b) => b.paidAt - a.paidAt).slice(0, 12);
 
   $('#money-split').innerHTML = `
     <div class="chip-row" id="splitChips">
@@ -995,6 +1076,7 @@ async function renderSplit() {
         <span>Tax reserve · ${cfg.taxPct}%</span>
         <span>−${fmtMoney(tax)}</span>
       </div>
+      ${status('tax')}
       <div class="flow-row sub">
         <span>After tax</span>
         <span>${fmtSigned(afterTax)}</span>
@@ -1003,6 +1085,7 @@ async function renderSplit() {
         <span>Buffer reserve · ${cfg.resPct}%</span>
         <span>−${fmtMoney(reserve)}</span>
       </div>
+      ${status('buffer')}
       <div class="flow-row sub">
         <span>To distribute</span>
         <span>${fmtSigned(toSplit)}</span>
@@ -1011,10 +1094,12 @@ async function renderSplit() {
         <span>${esc(cfg.name1)} · ${cfg.sharePct}%</span>
         <span>${fmtMoney(share1)}</span>
       </div>
+      ${status('share1')}
       <div class="flow-row share">
         <span>${esc(cfg.name2)} · ${(100 - cfg.sharePct).toLocaleString(undefined, { maximumFractionDigits: 2 })}%</span>
         <span>${fmtMoney(share2)}</span>
       </div>
+      ${status('share2')}
     </div>
     <div class="stat-grid" style="margin-top:12px">
       <div class="stat-card warn">
@@ -1029,7 +1114,53 @@ async function renderSplit() {
       </div>
     </div>
     ${base <= 0 ? '<div class="sub" style="font-size:13px;color:var(--md-on-surface-variant);margin-top:10px">No positive amount this period — nothing is set aside or distributed.</div>' : ''}
+    <h2 class="section-label">Totals · all time</h2>
+    <div class="card totals-card">
+      ${['share1', 'share2'].map(k => `
+        <div class="tot-row">
+          <span class="tot-name">${esc(payoutLabel(k))}</span>
+          <span class="tot-main">${fmtMoney(tot[k])} <small>paid out</small></span>
+          <span class="tot-open ${openAmt(k) ? 'is-open' : ''}">${openAmt(k) ? fmtMoney(openAmt(k)) + ' still to pay' : 'all paid'}</span>
+        </div>`).join('')}
+      <div class="tot-row">
+        <span class="tot-name">Buffer</span>
+        <span class="tot-main">${fmtMoney(inBuffer)} <small>in the buffer</small></span>
+        <span class="tot-open ${openAmt('buffer') ? 'is-open' : ''}">${openAmt('buffer') ? fmtMoney(openAmt('buffer')) + ' still to set aside' : 'all set aside'}${withdrawn ? ` · ${fmtMoney(withdrawn)} taken out` : ''}</span>
+      </div>
+      <div class="tot-row">
+        <span class="tot-name">Tax reserve</span>
+        <span class="tot-main">${fmtMoney(tot.tax)} <small>set aside</small></span>
+        <span class="tot-open ${openAmt('tax') ? 'is-open' : ''}">${openAmt('tax') ? fmtMoney(openAmt('tax')) + ' still to set aside' : 'all set aside'}</span>
+      </div>
+      <button class="btn-tonal" id="bufferTake" ${inBuffer > 0 ? '' : 'disabled'}>Take from buffer…</button>
+      <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);margin-top:8px">“Still to pay” adds up every month's split up to today. Paid-out shares come off the bank balance; tax and buffer stay company money.</div>
+    </div>
+    ${history.length ? `
+    <h2 class="section-label">Recent payouts</h2>
+    <div class="card">
+      ${history.map(x => `
+        <button class="flow-row payout-row" data-payout="${x.id}">
+          <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${fmtDate(x.paidAt)}</small></span>
+          <span>${x.withdrawal ? '−' : ''}${fmtMoney(x.amount)}</span>
+        </button>`).join('')}
+    </div>` : ''}
     <button class="btn-tonal" id="splitSettings" style="margin-top:14px">Adjust percentages…</button>`;
+
+  document.querySelectorAll('[data-pay]').forEach(b => b.onclick = () => recordPayout(b.dataset.pay, Number(b.dataset.amount), per));
+  document.querySelectorAll('[data-undo]').forEach(b => b.onclick = () => {
+    const list = paidHere[b.dataset.undo];
+    showConfirm(`Undo “${payoutLabel(b.dataset.undo)} ${isShareKind(b.dataset.undo) ? 'paid' : 'set aside'}” for ${per.label} (${fmtMoney(list.reduce((t, x) => t + x.amount, 0))})?`, async () => {
+      for (const x of list) await DB.delete('payouts', x.id);
+      snack('Undone'); render();
+    }, 'Undo');
+  });
+  document.querySelectorAll('[data-payout]').forEach(b => b.onclick = () => {
+    const x = payouts.find(y => y.id === Number(b.dataset.payout));
+    showConfirm(`Delete this record (${x.withdrawal ? 'taken from buffer' : payoutLabel(x.kind) + ' · ' + x.periodLabel}, ${fmtMoney(x.amount)})?`, async () => {
+      await DB.delete('payouts', x.id); snack('Record deleted'); render();
+    });
+  });
+  $('#bufferTake').onclick = () => openBufferWithdraw(inBuffer);
 
   document.querySelectorAll('#splitChips [data-speriod]').forEach(chip =>
     chip.addEventListener('click', () => { state.period = chip.dataset.speriod; state.periodOffset = 0; renderSplit(); renderReports(); }));
@@ -1092,9 +1223,12 @@ const hitsBank = p => !isPersonal(p) || p.reimbursed;
    by a person on the day the company paid them back (older records without
    that date fall back to the expense date). */
 const bankTs = p => (isPersonal(p) && p.reimbursedAt) || p.receivedAt;
-/* Money out of the bank since ts (expenses + reimbursements). */
-const bankOutflowSince = (purchases, ts) =>
-  purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0);
+/* Money out of the bank since ts: expenses, reimbursements and profit
+   shares paid out to the partners. (Tax and buffer stay company money.) */
+const isSharePayout = x => x.kind === 'share1' || x.kind === 'share2';
+const bankOutflowSince = (purchases, payouts, ts) =>
+  purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0)
+  + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
 /* Mark expenses as paid back by the company — from now on they count
    against the bank balance, dated today. */
 async function markReimbursed(list) {
@@ -1112,10 +1246,10 @@ function bankCfg() {
 async function computeBank() {
   const cfg = bankCfg();
   if (!cfg) return null;
-  const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
+  const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
   const inflow = orders.filter(o => o.createdAt >= cfg.ts).reduce((s, o) => s + o.total, 0);
-  const outflow = bankOutflowSince(purchases, cfg.ts);
-  return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases };
+  const outflow = bankOutflowSince(purchases, payouts, cfg.ts);
+  return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases, payouts };
 }
 
 async function renderBank() {
@@ -1131,7 +1265,7 @@ async function renderBank() {
     return;
   }
 
-  const { cfg, inflow, outflow, balance, orders, purchases } = data;
+  const { cfg, inflow, outflow, balance, orders, purchases, payouts } = data;
   // Ledger: everything that moved the balance since the baseline.
   const moves = [];
   orders.forEach(o => { if (o.createdAt >= cfg.ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
@@ -1141,6 +1275,9 @@ async function renderBank() {
       text: isPersonal(p) ? `Paid back to ${esc(paidByLabel(p.paidBy))}: ${esc(p.description)}` : esc(p.description),
       amt: -(p.amount || 0)
     });
+  });
+  payouts.forEach(x => {
+    if (isSharePayout(x) && x.paidAt >= cfg.ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
   });
   moves.sort((a, b) => b.ts - a.ts);
 
@@ -1159,7 +1296,7 @@ async function renderBank() {
       <div class="stat-card">
         <div class="label">Out since baseline</div>
         <div class="value">${fmtMoney(outflow)}</div>
-        <div class="hint">expenses & reimbursements</div>
+        <div class="hint">expenses, pay-backs, profit shares</div>
       </div>
     </div>
     <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>

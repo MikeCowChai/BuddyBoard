@@ -1,6 +1,6 @@
 /* ============================================================
    db.js — data layer: local copy on this device + sync via Supabase
-   Stores: products, customers, orders, purchases (+ shared settings)
+   Stores: products, customers, orders, purchases, payouts (+ shared settings)
 
    How it works:
    - Everything is kept in memory and in a local IndexedDB copy, so the
@@ -18,7 +18,7 @@
    out the same id.
    ============================================================ */
 const DB = (() => {
-  const STORES = ['products', 'customers', 'orders', 'purchases'];
+  const STORES = ['products', 'customers', 'orders', 'purchases', 'payouts'];
   const cache = Object.fromEntries(STORES.map(s => [s, new Map()]));
   let settings = {};
   let outbox = [];                 // [{ seq, op }] in upload order
@@ -378,14 +378,15 @@ const DB = (() => {
 
     /* Full backup: every store in one JSON-able object. */
     async exportAll() {
-      const [products, customers, orders, purchases] = await Promise.all(STORES.map(s => api.getAll(s)));
-      return { app: 'buddyboard', version: 1, exportedAt: Date.now(), products, customers, orders, purchases };
+      const [products, customers, orders, purchases, payouts] = await Promise.all(STORES.map(s => api.getAll(s)));
+      return { app: 'buddyboard', version: 1, exportedAt: Date.now(), products, customers, orders, purchases, payouts };
     },
 
-    /* Restore a backup: REPLACES all shared data in every store. */
+    /* Restore a backup: REPLACES all shared data in every store the backup
+       contains (an older backup without e.g. payouts leaves those alone). */
     async importAll(data) {
       const ops = [];
-      STORES.forEach(store => {
+      STORES.filter(store => Array.isArray(data[store])).forEach(store => {
         const keep = new Set((data[store] || []).map(r => r.id));
         cache[store].forEach((_, id) => { if (!keep.has(id)) ops.push({ del: [store, id] }); });
         (data[store] || []).forEach(r => {
