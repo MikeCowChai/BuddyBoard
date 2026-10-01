@@ -560,3 +560,25 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   background: var(--md-tertiary-container); color: var(--md-on-tertiary-container);
 }
 .sync-state[hidden] { display: none; }
+
+/* ---- Reports: export buttons + printable report ---- */
+.report-actions { display: flex; gap: 8px; margin: -4px 0 14px; }
+.report-actions .btn-tonal { flex: 1; }
+.owed-row { padding: 4px 0; }
+.owed-pay { flex: none; padding: 6px 14px; }
+#printArea { display: none; }
+@media print {
+  @page { margin: 14mm; }
+  body > *:not(#printArea) { display: none !important; }
+  body { background: #fff !important; padding: 0 !important; }
+  #printArea { display: block !important; color: #000; font: 10.5pt/1.4 system-ui, sans-serif; }
+  #printArea h1 { font-size: 17pt; margin: 0 0 2pt; }
+  #printArea h2 { font-size: 12pt; margin: 14pt 0 4pt; break-after: avoid; }
+  #printArea .muted { color: #555; }
+  #printArea table { width: 100%; border-collapse: collapse; }
+  #printArea th, #printArea td { text-align: left; padding: 3pt 5pt; border-bottom: 0.5pt solid #ccc; vertical-align: top; }
+  #printArea th { border-bottom: 1pt solid #000; font-weight: 600; }
+  #printArea tr { break-inside: avoid; }
+  #printArea .num { text-align: right; white-space: nowrap; }
+  #printArea .total td { font-weight: 700; border-top: 1pt solid #000; border-bottom: none; }
+}

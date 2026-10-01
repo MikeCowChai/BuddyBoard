@@ -3,7 +3,7 @@
    (and refreshes the copy); offline it falls back to the copy. Data sync
    goes to Supabase directly and is never cached here.
    CACHE matches BUILD in app.js. */
-const CACHE = 'buddyboard-2.0.1';
+const CACHE = 'buddyboard-2.1.0';
 const SHELL = [
   './',
   './index.html',
@@ -11,6 +11,7 @@ const SHELL = [
   './supabase-config.js',
   './db.js',
   './cloud.js',
+  './xlsx.js',
   './app.js',
   './vendor/supabase.js',
   './manifest.webmanifest',

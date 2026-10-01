@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.0.1';
+const BUILD = '2.1.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -590,7 +590,7 @@ async function renderHome() {
   let bankBalance = null;
   if (bank) {
     const inflow = orders.filter(o => o.createdAt >= bank.ts).reduce((s, o) => s + o.total, 0);
-    const outflow = purchases.filter(p => p.receivedAt >= bank.ts && hitsBank(p)).reduce((s, p) => s + (p.amount || 0), 0);
+    const outflow = bankOutflowSince(purchases, bank.ts);
     bankBalance = bank.amount + inflow - outflow;
   }
 
@@ -726,6 +726,10 @@ async function renderReports() {
       <span class="label">${per.label}</span>
       <button id="periodNext" title="Next" ${per.off >= 0 ? 'disabled' : ''}>›</button>
     </div>
+    <div class="report-actions">
+      <button class="btn-tonal" id="reportPrint">Print / PDF</button>
+      <button class="btn-tonal" id="reportXlsx">Excel</button>
+    </div>
     <div class="stat-grid">
       <div class="stat-card hero">
         <div class="label">Revenue · ${per.label}</div>
@@ -802,6 +806,140 @@ async function renderReports() {
   const prev = $('#periodPrev'), next = $('#periodNext');
   if (prev) prev.onclick = () => { state.periodOffset--; renderReports(); };
   if (next) next.onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderReports(); } };
+  $('#reportPrint').onclick = () => printReport();
+  $('#reportXlsx').onclick = () => downloadReportXlsx();
+}
+
+/* ----- MONEY: report for the chosen period (print/PDF + Excel) ----- */
+async function reportData() {
+  const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
+  const per = computePeriod();
+  const inPer = ts => ts >= per.start && ts < per.end;
+  const pOrders = orders.filter(o => inPer(o.createdAt)).sort((a, b) => a.createdAt - b.createdAt);
+  const pExpenses = purchases.filter(p => inPer(p.receivedAt)).sort((a, b) => a.receivedAt - b.receivedAt);
+  const revenue = pOrders.reduce((s, o) => s + o.total, 0);
+  const costs = pExpenses.reduce((s, p) => s + (p.amount || 0), 0);
+  const byCat = {};
+  pExpenses.forEach(p => { const c = p.category || 'Other'; byCat[c] = (byCat[c] || 0) + (p.amount || 0); });
+  const perf = {};
+  pOrders.forEach(o => o.items.filter(inReports).forEach(i => {
+    if (!perf[i.name]) perf[i.name] = { name: i.name, revenue: 0, qty: 0, weight: i.unitType === 'weight' };
+    perf[i.name].revenue += i.lineTotal !== undefined ? i.lineTotal : i.qty * i.unitPrice;
+    perf[i.name].qty += i.qty;
+  }));
+  const reimbursed = purchases.filter(p => isPersonal(p) && p.reimbursed && p.reimbursedAt && inPer(p.reimbursedAt));
+  const owedNow = purchases.filter(p => isPersonal(p) && !p.reimbursed);
+  // Reports always name the year ("October 2026"), also for the current year.
+  const label = state.period === 'month'
+    ? new Date(per.start).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : per.label;
+  return {
+    per: { ...per, label }, pOrders, pExpenses, revenue, costs, profit: revenue - costs,
+    cats: Object.entries(byCat).sort((a, b) => b[1] - a[1]),
+    sellers: Object.values(perf).sort((a, b) => b.revenue - a.revenue),
+    split: computeSplit(revenue, costs), cfg: splitCfg(), reimbursed, owedNow,
+    endDay: new Date(per.end - 1)
+  };
+}
+const fmtDay = ts => new Date(ts).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+const signed = n => n < 0 ? '−' + fmtMoney(-n) : fmtMoney(n);
+const expensePaidBy = p => isPersonal(p) ? `${paidByLabel(p.paidBy)} (${p.reimbursed ? 'paid back' : 'not paid back'})` : 'Company';
+
+/* Printable report: rendered into #printArea, which is the only thing
+   shown when printing (see @media print). "Save as PDF" in the print
+   dialog turns it into a PDF. */
+async function printReport() {
+  const d = await reportData();
+  const { per, cfg, split } = d;
+  const table = (head, rows, foot) => `<table><thead><tr>${head.map(h => `<th${/^(Amount|Total|Revenue|Sold)$/.test(h) ? ' class="num"' : ''}>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.join('') || `<tr><td colspan="${head.length}" class="muted">None</td></tr>`}${foot || ''}</tbody></table>`;
+  $('#printArea').innerHTML = `
+    <h1>BuddyBoard report · ${esc(per.label)}</h1>
+    <p class="muted">${fmtDay(per.start)} – ${fmtDay(d.endDay)} · printed ${fmtDay(Date.now())} ${fmtTime(Date.now())}</p>
+    <h2>Summary</h2>
+    ${table(['', 'Amount'], [
+      `<tr><td>Revenue (${d.pOrders.length} order${d.pOrders.length === 1 ? '' : 's'})</td><td class="num">${fmtMoney(d.revenue)}</td></tr>`,
+      `<tr><td>Costs (${d.pExpenses.length} expense${d.pExpenses.length === 1 ? '' : 's'})</td><td class="num">−${fmtMoney(d.costs)}</td></tr>`,
+      `<tr class="total"><td>Profit</td><td class="num">${signed(d.profit)}</td></tr>`
+    ])}
+    <h2>Profit split</h2>
+    ${table(['', 'Amount'], [
+      `<tr><td>${cfg.base === 'revenue' ? 'Revenue' : 'Profit'}</td><td class="num">${signed(split.base)}</td></tr>`,
+      `<tr><td>Tax reserve · ${cfg.taxPct}%</td><td class="num">−${fmtMoney(split.tax)}</td></tr>`,
+      `<tr><td>Buffer reserve · ${cfg.resPct}%</td><td class="num">−${fmtMoney(split.reserve)}</td></tr>`,
+      `<tr><td>${esc(cfg.name1)} · ${cfg.sharePct}%</td><td class="num">${fmtMoney(split.share1)}</td></tr>`,
+      `<tr><td>${esc(cfg.name2)} · ${100 - cfg.sharePct}%</td><td class="num">${fmtMoney(split.share2)}</td></tr>`
+    ])}
+    ${d.cats.length ? `<h2>Costs by category</h2>${table(['Category', 'Amount'], d.cats.map(([c, a]) => `<tr><td>${esc(c)}</td><td class="num">${fmtMoney(a)}</td></tr>`))}` : ''}
+    ${d.sellers.length ? `<h2>Sales per product</h2>${table(['Product', 'Sold', 'Revenue'], d.sellers.map(r => `<tr><td>${esc(r.name)}</td><td class="num">${r.weight ? fmtGrams(r.qty) : r.qty + '×'}</td><td class="num">${fmtMoney(r.revenue)}</td></tr>`))}` : ''}
+    <h2>Orders</h2>
+    ${table(['Date', 'Order', 'Customer', 'Items', 'Total'], d.pOrders.map(o => `<tr><td>${fmtDay(o.createdAt)}</td><td>${orderNo(o)}</td><td>${esc(o.customerName)}</td><td>${o.items.map(i => itemLabel(i)).join(', ')}</td><td class="num">${fmtMoney(o.total)}</td></tr>`),
+      `<tr class="total"><td colspan="4">Total</td><td class="num">${fmtMoney(d.revenue)}</td></tr>`)}
+    <h2>Expenses</h2>
+    ${table(['Date', 'Description', 'Category', 'Supplier', 'Paid by', 'Amount'], d.pExpenses.map(p => `<tr><td>${fmtDay(p.receivedAt)}</td><td>${esc(p.description)}</td><td>${esc(p.category || 'Other')}</td><td>${esc(p.supplier || '')}</td><td>${esc(expensePaidBy(p))}</td><td class="num">${fmtMoney(p.amount)}</td></tr>`),
+      `<tr class="total"><td colspan="5">Total</td><td class="num">${fmtMoney(d.costs)}</td></tr>`)}
+    ${d.reimbursed.length ? `<h2>Paid back to partners in this period</h2>${table(['Paid back on', 'To', 'Expense', 'Amount'], d.reimbursed.map(p => `<tr><td>${fmtDay(p.reimbursedAt)}</td><td>${esc(paidByLabel(p.paidBy))}</td><td>${esc(p.description)}</td><td class="num">${fmtMoney(p.amount)}</td></tr>`))}` : ''}
+    ${d.owedNow.length ? `<h2>Still to pay back (today)</h2>${table(['Expense date', 'To', 'Expense', 'Amount'], d.owedNow.map(p => `<tr><td>${fmtDay(p.receivedAt)}</td><td>${esc(paidByLabel(p.paidBy))}</td><td>${esc(p.description)}</td><td class="num">${fmtMoney(p.amount)}</td></tr>`))}` : ''}`;
+  const title = document.title;
+  document.title = `BuddyBoard report ${per.label}`; // default PDF file name
+  window.print();
+  document.title = title;
+}
+
+/* Excel export (.xlsx): Summary, Orders, Expenses and Products sheets.
+   Amounts are real numbers, so Excel/Sheets/Numbers can sum and filter. */
+async function downloadReportXlsx() {
+  const d = await reportData();
+  const { cfg, split } = d;
+  const day = ts => tsToDateInput(ts);
+  const summary = [
+    ['BuddyBoard report', d.per.label],
+    ['Period', `${day(d.per.start)} to ${day(d.endDay)}`],
+    [],
+    ['Revenue', d.revenue], ['Orders', d.pOrders.length],
+    ['Costs', d.costs], ['Expenses', d.pExpenses.length],
+    ['Profit', d.profit],
+    [],
+    ['Profit split', ''],
+    [cfg.base === 'revenue' ? 'Revenue' : 'Profit', split.base],
+    [`Tax reserve ${cfg.taxPct}%`, -split.tax],
+    [`Buffer reserve ${cfg.resPct}%`, -split.reserve],
+    [`${cfg.name1} ${cfg.sharePct}%`, split.share1],
+    [`${cfg.name2} ${100 - cfg.sharePct}%`, split.share2],
+    [],
+    ['Costs by category', ''],
+    ...d.cats
+  ];
+  const orders = [['Date', 'Order', 'Customer', 'Items', 'Subtotal', 'Discount %', 'Total', 'Status'],
+    ...d.pOrders.map(o => [day(o.createdAt), orderNo(o), o.customerName,
+      o.items.map(i => i.unitType === 'weight' ? `${fmtGrams(i.qty)} ${i.name}` : `${i.qty}x ${i.name}`).join(', '),
+      o.subtotal ?? o.total, o.discountPct || 0, o.total, o.status]),
+    [], ['Total', '', '', '', '', '', d.revenue]];
+  const expenses = [['Date', 'Description', 'Category', 'Supplier', 'Paid by', 'Paid back on', 'Amount'],
+    ...d.pExpenses.map(p => [day(p.receivedAt), p.description, p.category || 'Other', p.supplier || '',
+      expensePaidBy(p), isPersonal(p) && p.reimbursedAt ? day(p.reimbursedAt) : '', p.amount || 0]),
+    [], ['Total', '', '', '', '', '', d.costs]];
+  const products = [['Product', 'Sold', 'Unit', 'Revenue'],
+    ...d.sellers.map(r => [r.name, r.weight ? r.qty / 1000 : r.qty, r.weight ? 'kg' : 'pcs', r.revenue])];
+  const blob = buildXlsx([
+    { name: 'Summary', rows: summary, widths: [28, 18] },
+    { name: 'Orders', rows: orders, widths: [12, 14, 22, 44, 11, 10, 11, 18] },
+    { name: 'Expenses', rows: expenses, widths: [12, 30, 13, 20, 24, 13, 11] },
+    { name: 'Products', rows: products, widths: [28, 10, 8, 12] }
+  ]);
+  await saveFile(`BuddyBoard ${d.per.label}.xlsx`, blob, 'Report');
+}
+
+/* Share (phone) or download (computer) a generated file. */
+async function saveFile(name, blob, what = 'File') {
+  const file = new File([blob], name, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] }) && matchMedia('(pointer: coarse)').matches) {
+    try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  snack(`${what} saved: ${name}`);
 }
 
 /* ----- MONEY: profit split ----- */
@@ -815,6 +953,17 @@ function splitCfg() {
   catch { return { ...SPLIT_DEFAULTS }; }
 }
 
+function computeSplit(revenue, costs, cfg = splitCfg()) {
+  const base = cfg.base === 'revenue' ? revenue : revenue - costs;
+  const tax = base > 0 ? Math.round(base * cfg.taxPct / 100) : 0;
+  const afterTax = base - tax;
+  const reserve = afterTax > 0 ? Math.round(afterTax * cfg.resPct / 100) : 0;
+  const toSplit = afterTax - reserve;
+  const share1 = toSplit > 0 ? Math.round(toSplit * cfg.sharePct / 100) : 0;
+  const share2 = toSplit > 0 ? toSplit - share1 : 0;
+  return { base, tax, afterTax, reserve, toSplit, share1, share2 };
+}
+
 async function renderSplit() {
   const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
   const per = computePeriod();
@@ -824,15 +973,7 @@ async function renderSplit() {
     .reduce((s, o) => s + o.total, 0);
   const costs = purchases.filter(pu => pu.receivedAt >= per.start && pu.receivedAt < per.end)
     .reduce((s, pu) => s + (pu.amount || 0), 0);
-  const profit = revenue - costs;
-  const base = cfg.base === 'revenue' ? revenue : profit;
-
-  const tax = base > 0 ? Math.round(base * cfg.taxPct / 100) : 0;
-  const afterTax = base - tax;
-  const reserve = afterTax > 0 ? Math.round(afterTax * cfg.resPct / 100) : 0;
-  const toSplit = afterTax - reserve;
-  const share1 = toSplit > 0 ? Math.round(toSplit * cfg.sharePct / 100) : 0;
-  const share2 = toSplit > 0 ? toSplit - share1 : 0;
+  const { base, tax, afterTax, reserve, toSplit, share1, share2 } = computeSplit(revenue, costs, cfg);
   const fmtSigned = n => n < 0 ? '−' + fmtMoney(-n) : fmtMoney(n);
 
   $('#money-split').innerHTML = `
@@ -948,6 +1089,19 @@ const paidByLabel = pb => {
 };
 const isPersonal = p => p.paidBy === 'p1' || p.paidBy === 'p2';
 const hitsBank = p => !isPersonal(p) || p.reimbursed;
+/* When an expense leaves the bank: company-paid on the expense date; fronted
+   by a person on the day the company paid them back (older records without
+   that date fall back to the expense date). */
+const bankTs = p => (isPersonal(p) && p.reimbursedAt) || p.receivedAt;
+/* Money out of the bank since ts (expenses + reimbursements). */
+const bankOutflowSince = (purchases, ts) =>
+  purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0);
+/* Mark expenses as paid back by the company — from now on they count
+   against the bank balance, dated today. */
+async function markReimbursed(list) {
+  const now = Date.now();
+  for (const p of list) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: now });
+}
 
 /* ----- MONEY: bank balance ----- */
 /* The user anchors a real balance at a moment in time. From then on the
@@ -961,7 +1115,7 @@ async function computeBank() {
   if (!cfg) return null;
   const [orders, purchases] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases')]);
   const inflow = orders.filter(o => o.createdAt >= cfg.ts).reduce((s, o) => s + o.total, 0);
-  const outflow = purchases.filter(p => p.receivedAt >= cfg.ts && hitsBank(p)).reduce((s, p) => s + (p.amount || 0), 0);
+  const outflow = bankOutflowSince(purchases, cfg.ts);
   return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases };
 }
 
@@ -982,7 +1136,13 @@ async function renderBank() {
   // Ledger: everything that moved the balance since the baseline.
   const moves = [];
   orders.forEach(o => { if (o.createdAt >= cfg.ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
-  purchases.forEach(p => { if (p.receivedAt >= cfg.ts && hitsBank(p)) moves.push({ ts: p.receivedAt, text: esc(p.description) + (isPersonal(p) ? ' (reimbursed)' : ''), amt: -(p.amount || 0) }); });
+  purchases.forEach(p => {
+    if (hitsBank(p) && bankTs(p) >= cfg.ts) moves.push({
+      ts: bankTs(p),
+      text: isPersonal(p) ? `Paid back to ${esc(paidByLabel(p.paidBy))}: ${esc(p.description)}` : esc(p.description),
+      amt: -(p.amount || 0)
+    });
+  });
   moves.sort((a, b) => b.ts - a.ts);
 
   $('#money-bank').innerHTML = `
@@ -1000,7 +1160,7 @@ async function renderBank() {
       <div class="stat-card">
         <div class="label">Out since baseline</div>
         <div class="value">${fmtMoney(outflow)}</div>
-        <div class="hint">expenses</div>
+        <div class="hint">expenses & reimbursements</div>
       </div>
     </div>
     <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>
@@ -1012,7 +1172,7 @@ async function renderBank() {
           <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
         </div>`).join('') || '<div class="empty">Nothing has moved the balance yet.</div>'}
     </div>
-    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here, and expenses fronted personally only count once marked reimbursed — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
+    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
   $('#bankUpdate').onclick = () => openBankSheet(balance);
 }
@@ -1170,10 +1330,23 @@ async function renderPurchases() {
   $('#owedCard').innerHTML = owedTotal > 0 ? `
     <div class="card" style="margin-top:12px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">
       <div style="font-weight:600;margin-bottom:4px">Outstanding reimbursements · ${fmtMoney(owedTotal)}</div>
-      ${owed.p1 > 0 ? `<div class="row" style="font-size:14px"><span>${esc(cfg.name1)} fronted</span><span style="font-weight:600">${fmtMoney(owed.p1)}</span></div>` : ''}
-      ${owed.p2 > 0 ? `<div class="row" style="font-size:14px"><span>${esc(cfg.name2)} fronted</span><span style="font-weight:600">${fmtMoney(owed.p2)}</span></div>` : ''}
-      <div style="font-size:12px;opacity:.8;margin-top:6px">long-press an expense to mark it reimbursed</div>
+      ${['p1', 'p2'].filter(k => owed[k] > 0).map(k => `
+        <div class="row owed-row" style="font-size:14px">
+          <span>${esc(k === 'p1' ? cfg.name1 : cfg.name2)} fronted <b>${fmtMoney(owed[k])}</b></span>
+          <button class="btn-tonal owed-pay" data-payback="${k}">Pay back</button>
+        </div>`).join('')}
+      <div style="font-size:12px;opacity:.8;margin-top:6px">“Pay back” when the company has transferred the money — it then comes off the bank balance. Single expenses: long-press → Mark as reimbursed.</div>
     </div>` : '';
+  document.querySelectorAll('[data-payback]').forEach(btn => btn.onclick = () => {
+    const who = btn.dataset.payback;
+    const open = purchases.filter(p => p.paidBy === who && !p.reimbursed);
+    const total = open.reduce((s, p) => s + (p.amount || 0), 0);
+    showConfirm(
+      `Company pays back ${paidByLabel(who)} ${fmtMoney(total)} (${open.length} expense${open.length === 1 ? '' : 's'})? This is taken off the bank balance today.`,
+      async () => { await markReimbursed(open); snack(`${paidByLabel(who)} paid back ${fmtMoney(total)}`); render(); },
+      'Pay back'
+    );
+  });
 
   let list = purchases;
   if (state.purchaseFilter === '__owed') list = purchases.filter(p => isPersonal(p) && !p.reimbursed);
@@ -1214,8 +1387,7 @@ async function renderPurchases() {
         </div>`);
       const r = $('#ioReimburse');
       if (r) r.onclick = async () => {
-        p.reimbursed = true;
-        await DB.put('purchases', p);
+        await markReimbursed([p]);
         closeSheet(); snack(`Reimbursed — ${paidByLabel(p.paidBy)} is paid back ${fmtMoney(p.amount)}`); render();
       };
       $('#ioEdit').onclick = () => { closeSheet(); openPurchaseForm(p); };
@@ -1269,9 +1441,12 @@ function openPurchaseForm(p) {
     if (!(amount > 0)) return snack('Enter an amount greater than 0');
     if (!ts) return snack('Pick a date');
     const paidBy = $('#pePaidBy').value;
+    const reimbursed = paidBy === 'company' ? false : $('#peReimbursed').checked;
+    // Ticking "reimbursed" here counts as paying back today.
+    const reimbursedAt = reimbursed ? (p.reimbursed ? p.reimbursedAt : Date.now()) : undefined;
     await DB.put('purchases', {
       ...p, description, amount, category: $('#peCategory').value,
-      paidBy, reimbursed: paidBy === 'company' ? false : $('#peReimbursed').checked,
+      paidBy, reimbursed, reimbursedAt,
       supplier: $('#peSupplier').value.trim(), receivedAt: ts
     });
     closeSheet(); snack('Expense updated'); render();
