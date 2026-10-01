@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.8.0';
+const BUILD = '2.8.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -1083,7 +1083,13 @@ async function openSettleSheet() {
         if (due[k] - paid > 0) perKind[k].push({ m, amount: due[k] - paid });
       });
     });
-    return { fronted, perKind };
+    // Already marked in the app with today's date (so counted as leaving
+    // the bank now), although it was really done before.
+    const marked = [
+      ...payouts.filter(x => PAYOUT_KINDS.includes(x.kind) && !x.withdrawal && !x.offBook && x.periodEnd <= until).map(x => ({ store: 'payouts', rec: x, amount: x.amount })),
+      ...purchases.filter(p => isPersonal(p) && p.reimbursed && !p.offBook && p.receivedAt < until).map(p => ({ store: 'purchases', rec: p, amount: p.amount || 0 }))
+    ];
+    return { fronted, perKind, marked };
   };
   const sum = list => list.reduce((t, x) => t + (x.amount || 0), 0);
   openSheet(`
@@ -1097,7 +1103,7 @@ async function openSettleSheet() {
       <button class="btn-filled" id="stlSave">Mark as settled</button>
     </div>`);
   const draw = () => {
-    const { fronted, perKind } = plan(Number($('#stlMonth').value));
+    const { fronted, perKind, marked } = plan(Number($('#stlMonth').value));
     const opt = (id, label, amount, n, checked) => `
       <label class="field-checkbox"><input type="checkbox" id="${id}" ${checked && amount ? 'checked' : ''} ${amount ? '' : 'disabled'}>
         <span><b>${label}</b> — ${amount ? `${fmtMoney(amount)}${n !== undefined ? ` (${n} expense${n === 1 ? '' : 's'})` : ''}` : 'nothing open'}</span></label>`;
@@ -1106,17 +1112,23 @@ async function openSettleSheet() {
       opt('stlShare1', `${esc(payoutLabel('share1'))}'s share paid`, sum(perKind.share1), undefined, true) +
       opt('stlShare2', `${esc(payoutLabel('share2'))}'s share paid`, sum(perKind.share2), undefined, true) +
       opt('stlBuffer', 'Buffer set aside', sum(perKind.buffer), undefined, false) +
-      opt('stlTax', 'Tax reserve set aside', sum(perKind.tax), undefined, false);
+      opt('stlTax', 'Tax reserve set aside', sum(perKind.tax), undefined, false) +
+      (marked.length ? `
+      <label class="field-checkbox stl-marked"><input type="checkbox" id="stlMarked" checked>
+        <span><b>Already marked in the app, but done before</b> — ${marked.length} item${marked.length === 1 ? '' : 's'}, ${fmtMoney(sum(marked))}. Keeps them as paid, but takes them out of the bank movements (they were not paid from the bank on the day you tapped).</span></label>` : '');
   };
   $('#stlMonth').onchange = draw;
   draw();
   $('#stlSave').onclick = () => {
     const idx = Number($('#stlMonth').value);
-    const { fronted, perKind } = plan(idx);
-    const picked = { fronted: $('#stlFronted').checked, share1: $('#stlShare1').checked, share2: $('#stlShare2').checked, buffer: $('#stlBuffer').checked, tax: $('#stlTax').checked };
+    const { fronted, perKind, marked } = plan(idx);
+    const picked = { fronted: $('#stlFronted').checked, share1: $('#stlShare1').checked, share2: $('#stlShare2').checked, buffer: $('#stlBuffer').checked, tax: $('#stlTax').checked, marked: !!($('#stlMarked') && $('#stlMarked').checked) };
     if (!Object.values(picked).some(Boolean)) return snack('Tick at least one item');
     showConfirm(`Mark the ticked items as settled up to and including ${months[idx].label}? The bank balance stays the same.`, async () => {
       const now = Date.now();
+      if (picked.marked) for (const { store, rec } of marked) {
+        await DB.put(store, store === 'purchases' ? { ...rec, reimbursedAt: rec.receivedAt, offBook: true } : { ...rec, offBook: true, note: rec.note || 'settled earlier' });
+      }
       if (picked.fronted) for (const p of fronted) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: p.receivedAt, offBook: true });
       for (const k of PAYOUT_KINDS) {
         if (!picked[k]) continue;
@@ -1293,8 +1305,19 @@ async function renderSplit() {
   });
   document.querySelectorAll('[data-payout]').forEach(b => b.onclick = () => {
     const x = payouts.find(y => y.id === Number(b.dataset.payout));
-    showConfirm(`Delete this record (${x.withdrawal ? 'taken from buffer' : payoutLabel(x.kind) + ' · ' + x.periodLabel}, ${fmtMoney(x.amount)})?`, async () => {
-      await DB.delete('payouts', x.id); snack('Record deleted'); render();
+    const title = x.withdrawal ? 'Taken from buffer' : `${payoutLabel(x.kind)} · ${x.periodLabel}`;
+    openSheet(`
+      <h2>${esc(title)}</h2>
+      <p class="sheet-sub">${fmtMoney(x.amount)} · ${x.offBook ? 'settled earlier (not via the tracked bank)' : 'recorded ' + fmtDate(x.paidAt)}</p>
+      <div class="form-card">
+        ${!x.withdrawal && !x.offBook ? `<button class="btn-tonal" id="poOffBook">It was settled earlier — take it out of the bank movements</button>` : ''}
+        ${!x.withdrawal && x.offBook ? `<button class="btn-tonal" id="poOnBook">It was paid from the bank on ${fmtDate(x.paidAt)}</button>` : ''}
+        <button class="btn-text danger" id="poDelete">Delete record</button>
+      </div>`);
+    if ($('#poOffBook')) $('#poOffBook').onclick = async () => { await DB.put('payouts', { ...x, offBook: true }); closeSheet(); snack('Marked as settled earlier'); render(); };
+    if ($('#poOnBook')) $('#poOnBook').onclick = async () => { await DB.put('payouts', { ...x, offBook: false }); closeSheet(); snack('Counted from the bank again'); render(); };
+    $('#poDelete').onclick = () => showConfirm(`Delete this record (${title}, ${fmtMoney(x.amount)})?`, async () => {
+      await DB.delete('payouts', x.id); closeSheet(); snack('Record deleted'); render();
     });
   });
   if ($('#bufferTake')) $('#bufferTake').onclick = () => openBufferWithdraw(inBuffer);
