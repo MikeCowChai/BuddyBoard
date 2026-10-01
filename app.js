@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.0.0';
+const BUILD = '2.0.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
