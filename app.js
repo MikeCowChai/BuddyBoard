@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.9.0';
+const BUILD = '2.10.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -2794,7 +2794,7 @@ async function openCustomerDetail(id) {
   const referrer = customers.find(x => x.id === c.referredBy);
   const brought = referralsOf(customers, id).sort((a, b) => spentBy(b.id) - spentBy(a.id));
   const chain = referralChain(customers, id);
-  const chainRevenue = [...chain].reduce((s, cid) => s + spentBy(cid), 0);
+  const refRev = referralRevenue(customers, orders, id);
   openSheet(`
     <h2>${esc(c.name)}</h2>
     <div class="sub" style="color:var(--md-on-surface-variant);margin:-8px 0 2px">${custNo(c) ? `<b>${custNo(c)}</b> · ` : ''}${esc(c.phone || 'No phone on file')}${c.email ? ' · ' + esc(c.email) : ''}</div>
@@ -2804,24 +2804,22 @@ async function openCustomerDetail(id) {
       ${referrer ? `<button class="chip ref-chip" data-open-customer="${referrer.id}">via ${esc(referrer.name)} ›</button>` : ''}
       ${c.discountPct > 0 ? `<span class="chip is-selected">${c.discountPct}% standard discount</span>` : ''}
     </div>` : ''}
-    <div class="chip-row" style="padding:0;margin:0 0 14px">
-      ${referrer ? '' : '<button class="chip" id="cdSetRef">＋ Set “referred by”</button>'}
-      <button class="chip" id="cdAddRef">＋ Link a customer they brought</button>
+    <div class="chip-row" style="padding:0;margin:0 0 14px;flex-wrap:wrap;overflow:visible">
+      ${referrer ? '' : '<button class="chip" id="cdSetRef">＋ Referred by…</button>'}
+      <button class="chip" id="cdAddRef">＋ Someone they brought…</button>
     </div>
     <div class="stat-grid">
       <div class="stat-card"><div class="label">Total spent</div><div class="value" style="font-size:24px">${fmtMoney(spent)}</div></div>
       <div class="stat-card"><div class="label">Orders</div><div class="value" style="font-size:24px">${theirs.length}</div></div>
     </div>
     ${brought.length ? `
-    <h2 class="section-label">Brought in ${brought.length} customer${brought.length === 1 ? '' : 's'}</h2>
+    <h2 class="section-label">Brought in ${brought.length} customer${brought.length === 1 ? '' : 's'}${chain.size > brought.length ? ` · ${chain.size} incl. via via` : ''}</h2>
     <div class="card">
-      ${brought.map(r => `
-        <button class="flow-row ref-row" data-open-customer="${r.id}">
-          <span>${esc(r.name)}${referralsOf(customers, r.id).length ? `<small> · brought ${referralsOf(customers, r.id).length} more</small>` : ''}</span>
-          <span>${fmtMoney(spentBy(r.id))} ›</span>
-        </button>`).join('')}
-      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);padding:8px 4px 2px">
-        ${chain.size > brought.length ? `${chain.size} customers in total through ${esc(c.name)} (incl. their referrals) · ` : ''}${fmtMoney(chainRevenue)} revenue from referrals
+      ${referralTreeHTML(customers, orders, id)}
+      <div class="ref-totals">
+        <span><i class="ref-key d"></i>Direct <b>${fmtMoney(refRev.direct)}</b></span>
+        <span><i class="ref-key i"></i>Via via <b>${fmtMoney(refRev.indirect)}</b></span>
+        <span>Total through ${esc(c.name)} <b>${fmtMoney(refRev.total)}</b></span>
       </div>
     </div>` : ''}
     <h2 class="section-label">Order history</h2>
@@ -2851,6 +2849,29 @@ async function openCustomerDetail(id) {
     await DB.delete('customers', id);
     closeSheet(); snack('Customer deleted'); render();
   });
+}
+
+/* Money that came in through a customer: from the people they brought in
+   themselves (direct) and from the people those brought in, and so on
+   (via via). Their own orders are not included. */
+function referralRevenue(customers, orders, id) {
+  const spentBy = cid => orders.filter(o => o.customerId === cid).reduce((t, o) => t + o.total, 0);
+  const directIds = referralsOf(customers, id).map(c => c.id);
+  const all = referralChain(customers, id);
+  const direct = directIds.reduce((t, cid) => t + spentBy(cid), 0);
+  const total = [...all].reduce((t, cid) => t + spentBy(cid), 0);
+  return { direct, indirect: total - direct, total, people: all.size, directPeople: directIds.length };
+}
+/* Nested list of everyone brought in through id (with what each spent). */
+function referralTreeHTML(customers, orders, id, seen = new Set([id])) {
+  const kids = referralsOf(customers, id).filter(k => !seen.has(k.id));
+  if (!kids.length) return '';
+  kids.forEach(k => seen.add(k.id));
+  const spentBy = cid => orders.filter(o => o.customerId === cid).reduce((t, o) => t + o.total, 0);
+  return `<ul class="ref-tree">${kids.sort((a, b) => spentBy(b.id) - spentBy(a.id)).map(k => `
+    <li><button class="ref-node" data-open-customer="${k.id}">
+      <span>${esc(k.name)} <small>${custNo(k)}</small></span><span class="amt">${fmtMoney(spentBy(k.id))}</span>
+    </button>${referralTreeHTML(customers, orders, k.id, seen)}</li>`).join('')}</ul>`;
 }
 
 /* Quick linking from a customer's detail:
@@ -2897,9 +2918,8 @@ async function customerSources() {
   const organic = customers.filter(c => !referred.includes(c));
   const revOf = list => list.reduce((t, c) => t + spentBy(c.id), 0);
   const referrers = customers.map(c => {
-    const direct = referralsOf(customers, c.id);
-    const chain = referralChain(customers, c.id);
-    return { c, direct: direct.length, chain: chain.size, revenue: [...chain].reduce((t, id) => t + spentBy(id), 0) };
+    const rr = referralRevenue(customers, orders, c.id);
+    return { c, direct: rr.directPeople, chain: rr.people, revenue: rr.total, revDirect: rr.direct, revIndirect: rr.indirect };
   }).filter(r => r.direct > 0).sort((a, b) => b.direct - a.direct || b.revenue - a.revenue);
   const first = Math.min(...customers.map(c => c.createdAt || Date.now()));
   const months = isFinite(first) ? monthsFrom(first, Date.now()).reverse().map(m => {
@@ -2907,6 +2927,49 @@ async function customerSources() {
     return { label: m.label, organic: added.filter(c => organic.includes(c)).length, referred: added.filter(c => referred.includes(c)).length };
   }).filter(m => m.organic + m.referred) : [];
   return { customers, organic, referred, orgRev: revOf(organic), refRev: revOf(referred), referrers, months };
+}
+
+/* Horizontal stacked bars: revenue through each top referrer, split into
+   direct (people they brought) and via via (people those brought). */
+function refChartHTML(referrers) {
+  const top = referrers.filter(r => r.revenue > 0).sort((a, b) => b.revenue - a.revenue).slice(0, 8);
+  if (!top.length) return '';
+  const max = top[0].revenue;
+  return `
+    <h2 class="section-label">Revenue through referrals</h2>
+    <div class="card ref-chart" id="refChart">
+      <div class="ref-legend"><span><i class="d"></i>Direct</span><span><i class="i"></i>Via via</span></div>
+      ${top.map((r, i) => `
+        <div class="ref-bar-row" data-ref-i="${i}" data-open-customer="${r.c.id}" role="button" tabindex="0"
+             aria-label="${esc(r.c.name)}: direct ${fmtMoney(r.revDirect)}, via via ${fmtMoney(r.revIndirect)}, total ${fmtMoney(r.revenue)}">
+          <span class="ref-bar-name">${esc(r.c.name)} <small>${custNo(r.c)}</small></span>
+          <span class="ref-bar-track">
+            ${r.revDirect > 0 ? `<span class="ref-seg d ${r.revIndirect > 0 ? '' : 'end'}" style="width:${(r.revDirect / max * 66).toFixed(2)}%"></span>` : ''}
+            ${r.revIndirect > 0 ? `<span class="ref-seg i end ${r.revDirect > 0 ? '' : 'first'}" style="width:${(r.revIndirect / max * 66).toFixed(2)}%"></span>` : ''}
+            <span class="ref-bar-val">${fmtMoney(r.revenue)}</span>
+          </span>
+        </div>`).join('')}
+      <div class="ref-tip" id="refTip" hidden></div>
+    </div>`;
+}
+function wireRefChart(referrers) {
+  const chart = $('#refChart');
+  if (!chart) return;
+  const top = referrers.filter(r => r.revenue > 0).sort((a, b) => b.revenue - a.revenue).slice(0, 8);
+  const tip = $('#refTip');
+  chart.querySelectorAll('.ref-bar-row').forEach(row => {
+    const r = top[Number(row.dataset.refI)];
+    const show = () => {
+      tip.innerHTML = `<b>${esc(r.c.name)}</b> ${custNo(r.c)}<br>Direct ${fmtMoney(r.revDirect)} · ${r.direct} ${r.direct === 1 ? 'person' : 'people'}<br>Via via ${fmtMoney(r.revIndirect)} · ${r.chain - r.direct} ${r.chain - r.direct === 1 ? 'person' : 'people'}`;
+      tip.hidden = false;
+      const top_ = row.offsetTop + row.offsetHeight + 2;
+      tip.style.top = top_ + 'px'; tip.style.left = '12px';
+    };
+    row.addEventListener('mouseenter', show);
+    row.addEventListener('focus', show);
+    row.addEventListener('mouseleave', () => { tip.hidden = true; });
+    row.addEventListener('blur', () => { tip.hidden = true; });
+  });
 }
 
 async function openCustomerSources() {
@@ -2920,11 +2983,12 @@ async function openCustomerSources() {
       <div class="stat-card"><div class="label">Organic</div><div class="value" style="font-size:24px">${d.organic.length}</div><div class="hint">${pct(d.organic.length)} · ${fmtMoney(d.orgRev)} revenue</div></div>
       <div class="stat-card"><div class="label">Referred</div><div class="value" style="font-size:24px">${d.referred.length}</div><div class="hint">${pct(d.referred.length)} · ${fmtMoney(d.refRev)} revenue</div></div>
     </div>
+    ${refChartHTML(d.referrers)}
     <h2 class="section-label">Best referrers</h2>
     <div class="card">
       ${d.referrers.slice(0, 15).map(r => `
         <button class="flow-row ref-row" data-open-customer="${r.c.id}">
-          <span>${esc(r.c.name)} <small>${custNo(r.c)} · brought ${r.direct}${r.chain > r.direct ? ` (${r.chain} incl. theirs)` : ''}</small></span>
+          <span>${esc(r.c.name)} <small>${custNo(r.c)} · brought ${r.direct}${r.chain > r.direct ? ` (${r.chain} incl. via via)` : ''}<br>direct ${fmtMoney(r.revDirect)} · via via ${fmtMoney(r.revIndirect)}</small></span>
           <span>${fmtMoney(r.revenue)} ›</span>
         </button>`).join('') || '<div class="empty">No referrals recorded yet.</div>'}
     </div>
@@ -2935,18 +2999,22 @@ async function openCustomerSources() {
     </div>
     <button class="btn-tonal" id="csXlsx" style="margin-top:14px">Download as Excel</button>`);
   document.querySelectorAll('[data-open-customer]').forEach(b => b.onclick = () => openCustomerDetail(Number(b.dataset.openCustomer)));
+  wireRefChart(d.referrers);
   $('#csXlsx').onclick = async () => {
     const [orders] = await Promise.all([DB.getAll('orders')]);
     const spentBy = id => orders.filter(o => o.customerId === id).reduce((t, o) => t + o.total, 0);
     const byId = id => d.customers.find(c => c.id === id);
-    const rows = [['No.', 'Customer', 'Source', 'Referred by', 'Brought in', 'Joined', 'Spent'],
-      ...d.customers.slice().sort((a, b) => (a.no || 0) - (b.no || 0)).map(c => [custNo(c), c.name,
-        d.referred.includes(c) ? 'Referred' : 'Organic', byId(c.referredBy) ? `${byId(c.referredBy).name} (${custNo(byId(c.referredBy))})` : '',
-        referralsOf(d.customers, c.id).length, c.createdAt ? tsToDateInput(c.createdAt) : '', spentBy(c.id)])];
+    const rows = [['No.', 'Customer', 'Source', 'Referred by', 'Brought in', 'Joined', 'Spent', 'Revenue via direct referrals', 'Revenue via via', 'Revenue through them (total)'],
+      ...d.customers.slice().sort((a, b) => (a.no || 0) - (b.no || 0)).map(c => {
+        const rr = referralRevenue(d.customers, orders, c.id);
+        return [custNo(c), c.name,
+          d.referred.includes(c) ? 'Referred' : 'Organic', byId(c.referredBy) ? `${byId(c.referredBy).name} (${custNo(byId(c.referredBy))})` : '',
+          referralsOf(d.customers, c.id).length, c.createdAt ? tsToDateInput(c.createdAt) : '', spentBy(c.id), rr.direct, rr.indirect, rr.total];
+      })];
     const summary = [['', 'Customers', 'Revenue'], ['Organic', d.organic.length, d.orgRev], ['Referred', d.referred.length, d.refRev], [],
       ['Month', 'Organic', 'Referred'], ...d.months.map(m => [m.label, m.organic, m.referred])];
     await saveFile(`BuddyBoard customer sources ${tsToDateInput(Date.now())}.xlsx`,
-      buildXlsx([{ name: 'Summary', rows: summary, widths: [22, 12, 12] }, { name: 'Customers', rows, widths: [8, 24, 10, 28, 10, 12, 10] }]), 'Overview');
+      buildXlsx([{ name: 'Summary', rows: summary, widths: [22, 12, 12] }, { name: 'Customers', rows, widths: [8, 24, 10, 28, 10, 12, 10, 14, 12, 14] }]), 'Overview');
   };
 }
 
