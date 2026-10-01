@@ -12,7 +12,7 @@ blijft de app gewoon werken; wijzigingen worden bewaard en verstuurd zodra er we
 ## 2. Database klaarzetten
 1. Links in het menu: **SQL Editor** → **New query**.
 2. Plak de volledige inhoud van [`supabase/schema.sql`](supabase/schema.sql).
-3. Pas **helemaal onderaan** de twee e-mailadressen aan naar die van jou en je compagnon.
+3. Pas **helemaal onderaan** de twee e-mailadressen aan naar die van jou (`admin`) en je compagnon (`member`).
 4. Klik **Run**. (Je mag dit later opnieuw draaien, bijv. om iemand toe te voegen.)
 
 ## 3. Accounts maken
@@ -44,6 +44,17 @@ Lukt het overzetten niet automatisch? Zet dan je backup terug via *Settings → 
   gebruikt is. Je gegevens blijven bewaard; in het Supabase-dashboard klik je op **Restore project**.
 - **Uitloggen** (Settings → Sign out) wist de kopie op dat apparaat; na opnieuw inloggen komt alles terug.
 - **Backup:** *Settings → Export all data* blijft werken — handig om af en toe te doen.
+
+## Admin en member
+- **admin** mag alles.
+- **member** doet het dagelijkse werk (orders, klanten, producten, voorraad, uitgaven invoeren),
+  maar kan de winstverdeling, uitbetalingen/buffer, het banksaldo, de bonvoettekst, terugbetalen,
+  backups importeren en hernummeren niet veranderen. De database controleert dit zelf.
+- Rol wijzigen: Supabase → SQL Editor →
+  `update public.team set role = 'member' where email = '…';` (of `'admin'`).
+  Op het apparaat geldt de nieuwe rol na één keer verversen.
+- Bestaand project van vóór 2.4.0: voer eenmalig [`supabase/upgrade-2.4.0-roles.sql`](supabase/upgrade-2.4.0-roles.sql) uit
+  (zet onderaan het e-mailadres van je compagnon).
 
 ## Versienummers
 `MAJOR.MINOR.PATCH`, te zien onderaan in *Settings*:

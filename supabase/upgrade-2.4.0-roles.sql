@@ -1,7 +1,9 @@
 -- ============================================================
--- BuddyBoard — Supabase database setup
--- Paste this whole file into Supabase → SQL Editor → New query → Run.
--- Safe to run again (e.g. after editing the team emails at the bottom).
+-- BuddyBoard 2.4.0 — upgrade an EXISTING Supabase project: admin/member roles
+-- 1. Change the email at the very bottom to your compagnon's email.
+-- 2. Supabase → SQL Editor → New query → paste this whole file → Run.
+-- Everyone already on the team stays admin until set to 'member' below.
+-- Safe to run more than once. (New projects: use schema.sql instead.)
 -- ============================================================
 
 -- Every BuddyBoard item (product, customer, order, purchase, setting) is
@@ -159,11 +161,9 @@ exception when duplicate_object then null;
 end $$;
 
 -- ------------------------------------------------------------
--- TEAM: put your email addresses here (the same ones you use to
--- sign in), then run this file. 'admin' = may change everything,
--- 'member' = daily work only.
+-- Who is a member (daily work only)? Put your compagnon's email here.
 -- ------------------------------------------------------------
-insert into public.team (email, role) values
-  ('jij@example.com', 'admin'),
-  ('compagnon@example.com', 'member')
-on conflict (email) do update set role = excluded.role;
+update public.team set role = 'member' where lower(email) = lower('compagnon@example.com');
+
+-- Check the result (shows each email with its role):
+select email, role from public.team order by role, email;

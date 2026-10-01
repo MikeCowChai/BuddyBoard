@@ -162,9 +162,45 @@ const DB = (() => {
       pull(); // pick up the server's version (e.g. stock after other devices' changes)
     } catch (err) {
       flushing = false;
+      if (isAdminOnly(err)) return dropRefused();
       if (!isNetworkError(err)) onSyncError(err);
       flushTimer = setTimeout(flush, 15000);
     }
+  }
+
+  /* The server refused a change this account may not make (e.g. a member
+     editing the profit split). Send the queued changes one by one, drop
+     the refused ones and put the server's version back on this device. */
+  const isAdminOnly = err => err && err.code === '42501' && /admin only/i.test(err.message || '');
+  async function dropRefused() {
+    flushing = true;
+    const refused = [];
+    try {
+      while (outbox.length) {
+        const e = outbox[0];
+        const { error } = await sb.rpc('apply_ops', { ops: [e.op] });
+        if (error && !isAdminOnly(error)) throw error;
+        if (error) refused.push(e.op);
+        await idbTx(['outbox'], t => t.objectStore('outbox').delete(e.seq));
+        outbox.shift();
+        const k = pkey(e.op.store, e.op.key);
+        const n = (pending.get(k) || 1) - 1;
+        if (n > 0) pending.set(k, n); else pending.delete(k);
+      }
+    } catch (err) {
+      flushing = false;
+      flushTimer = setTimeout(flush, 15000);
+      return;
+    }
+    flushing = false;
+    notifyStatus();
+    for (const op of refused) {
+      const { data } = await sb.from('records').select('store,key,data,deleted,updated_at')
+        .eq('store', op.store).eq('key', op.key).maybeSingle();
+      applyRemote([data || { store: op.store, key: op.key, data: null, deleted: true }]);
+    }
+    if (refused.length) onSyncError(new Error('admin only'));
+    pull();
   }
 
   /* ---------------- Downloading ---------------- */
@@ -229,7 +265,15 @@ const DB = (() => {
     if (channel) sb.removeChannel(channel);
     channel = sb.channel('buddyboard-records')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'records' }, payload => {
-        if (payload.new && payload.new.store) applyRemote([payload.new]);
+        const row = payload.new;
+        if (!row || !row.store) return;
+        // Realtime unpacks a JSON column holding a JSON-looking string
+        // ('{"a":1}', '2') into an object/number. Settings are always
+        // strings, so turn them back into the text that was saved.
+        if (row.store === 'settings' && row.data !== null && row.data !== undefined && typeof row.data !== 'string') {
+          row.data = JSON.stringify(row.data);
+        }
+        applyRemote([row]);
       })
       .subscribe(status => { if (status === 'SUBSCRIBED') pull(); });
   }
