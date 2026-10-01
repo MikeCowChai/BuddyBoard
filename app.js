@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.5.0';
+const BUILD = '2.6.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -197,6 +197,13 @@ function openSettings() {
         </div>
         <span class="set-chevron">›</span>
       </button>
+      <button class="set-row" id="setSettle" ${isAdmin() ? '' : 'disabled'}>
+        <div class="set-main">
+          <div class="set-title">Mark as settled up to… ${isAdmin() ? '' : ADMIN_NOTE}</div>
+          <div class="set-sub">pay-backs / payouts already done outside the app</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>
       <button class="set-row" id="setSplit" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
           <div class="set-title">Profit split percentages ${isAdmin() ? '' : ADMIN_NOTE}</div>
@@ -262,6 +269,7 @@ function openSettings() {
 
   $('#setBank').onclick = () => openBankSheet();
   $('#setSplit').onclick = () => openSplitSettings();
+  $('#setSettle').onclick = () => openSettleSheet();
   $('#setFooter').onclick = () => openFooterSheet();
   $('#stSignOut').onclick = () => showConfirm('Sign out of BuddyBoard on this device?', () => Cloud.signOut(), 'Sign out');
   $('#stRenumber').onclick = () => {
@@ -849,7 +857,7 @@ async function reportData() {
     per: { ...per, label }, pOrders, pExpenses, revenue, costs, profit: revenue - costs,
     cats: Object.entries(byCat).sort((a, b) => b[1] - a[1]),
     sellers: Object.values(perf).sort((a, b) => b.revenue - a.revenue),
-    split: computeSplit(revenue, costs), cfg: splitCfg(), reimbursed, owedNow,
+    split: computeSplitBetween(orders, purchases, per.start, per.end), cfg: splitCfgAt(Math.min(per.end - 1, Date.now())), reimbursed, owedNow,
     endDay: new Date(per.end - 1)
   };
 }
@@ -966,6 +974,31 @@ function splitCfg() {
   catch { return { ...SPLIT_DEFAULTS }; }
 }
 
+/* Percentage changes apply from the moment they are saved: earlier sales
+   keep the percentages that were valid then. erp_split_cfg holds the
+   current percentages plus `previous: [{ until, base, taxPct, resPct,
+   sharePct }]` (oldest first) — the versions that applied before. */
+function splitCfgAt(ts) {
+  const cfg = splitCfg();
+  const old = (cfg.previous || []).find(p => ts < p.until);
+  return old ? { ...cfg, ...old } : cfg;
+}
+/* The split of everything between start and end, computed piece by piece
+   where the percentages changed in between. */
+function computeSplitBetween(orders, purchases, start, end) {
+  const cuts = (splitCfg().previous || []).map(p => p.until).filter(t => t > start && t < end);
+  const edges = [start, ...cuts, end];
+  const total = { base: 0, tax: 0, afterTax: 0, reserve: 0, toSplit: 0, share1: 0, share2: 0 };
+  for (let i = 0; i < edges.length - 1; i++) {
+    const a = edges[i], b = edges[i + 1];
+    const rev = orders.filter(o => o.createdAt >= a && o.createdAt < b).reduce((t, o) => t + o.total, 0);
+    const cost = purchases.filter(p => p.receivedAt >= a && p.receivedAt < b).reduce((t, p) => t + (p.amount || 0), 0);
+    const part = computeSplit(rev, cost, splitCfgAt(a));
+    Object.keys(total).forEach(k => { total[k] += part[k]; });
+  }
+  return { ...total, changedAt: cuts };
+}
+
 function computeSplit(revenue, costs, cfg = splitCfg()) {
   const base = cfg.base === 'revenue' ? revenue : revenue - costs;
   const tax = base > 0 ? Math.round(base * cfg.taxPct / 100) : 0;
@@ -995,15 +1028,89 @@ function splitDueAllTime(orders, purchases) {
   const first = Math.min(...orders.map(o => o.createdAt), ...purchases.map(p => p.receivedAt));
   const due = { tax: 0, buffer: 0, share1: 0, share2: 0 };
   if (!isFinite(first)) return due;
-  const cfg = splitCfg(), now = new Date();
-  for (let d = new Date(new Date(first).getFullYear(), new Date(first).getMonth(), 1); d <= now; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) {
-    const s = d.getTime(), e = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
-    const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((t, o) => t + o.total, 0);
-    const cost = purchases.filter(p => p.receivedAt >= s && p.receivedAt < e).reduce((t, p) => t + (p.amount || 0), 0);
-    const a = splitAmounts(computeSplit(rev, cost, cfg));
+  monthsFrom(first, Date.now()).forEach(m => {
+    const a = splitAmounts(computeSplitBetween(orders, purchases, m.start, m.end));
     PAYOUT_KINDS.forEach(k => { due[k] += a[k]; });
-  }
+  });
   return due;
+}
+/* Calendar months [{ start, end, label }] from the month of `from` up to
+   and including the month of `to`. */
+function monthsFrom(from, to) {
+  const out = [];
+  for (let d = new Date(new Date(from).getFullYear(), new Date(from).getMonth(), 1); d.getTime() <= to; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) {
+    out.push({ start: d.getTime(), end: new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime(),
+      label: d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) });
+  }
+  return out;
+}
+
+/* Catch up with history: mark everything up to (and including) a chosen
+   month as already settled — fronted expenses as paid back, and/or the
+   split as paid out / set aside — WITHOUT changing the tracked bank
+   balance (that money moved before the app tracked it). */
+async function openSettleSheet() {
+  if (!requireAdmin()) return;
+  const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
+  const first = Math.min(...orders.map(o => o.createdAt), ...purchases.map(p => p.receivedAt));
+  if (!isFinite(first)) return snack('Nothing to settle yet');
+  const months = monthsFrom(first, Date.now());
+  const def = Math.max(0, months.length - 2); // last complete month
+  const plan = idx => {
+    const until = months[idx].end;
+    const fronted = purchases.filter(p => isPersonal(p) && !p.reimbursed && p.receivedAt < until);
+    const perKind = Object.fromEntries(PAYOUT_KINDS.map(k => [k, []]));
+    months.slice(0, idx + 1).forEach(m => {
+      const due = splitAmounts(computeSplitBetween(orders, purchases, m.start, m.end));
+      PAYOUT_KINDS.forEach(k => {
+        const paid = payouts.filter(x => x.kind === k && !x.withdrawal && x.periodStart >= m.start && x.periodEnd <= m.end).reduce((t, x) => t + x.amount, 0);
+        if (due[k] - paid > 0) perKind[k].push({ m, amount: due[k] - paid });
+      });
+    });
+    return { fronted, perKind };
+  };
+  const sum = list => list.reduce((t, x) => t + (x.amount || 0), 0);
+  openSheet(`
+    <h2>Mark as settled</h2>
+    <p class="sheet-sub">For things that were already handled outside the app. The bank balance is <b>not</b> changed.</p>
+    <div class="form-card">
+      <label class="field"><span>Settled up to and including</span>
+        <select id="stlMonth">${months.map((m, i) => `<option value="${i}" ${i === def ? 'selected' : ''}>${m.label}</option>`).join('')}</select>
+      </label>
+      <div id="stlOptions"></div>
+      <button class="btn-filled" id="stlSave">Mark as settled</button>
+    </div>`);
+  const draw = () => {
+    const { fronted, perKind } = plan(Number($('#stlMonth').value));
+    const opt = (id, label, amount, n, checked) => `
+      <label class="field-checkbox"><input type="checkbox" id="${id}" ${checked && amount ? 'checked' : ''} ${amount ? '' : 'disabled'}>
+        <span><b>${label}</b> — ${amount ? `${fmtMoney(amount)}${n !== undefined ? ` (${n} expense${n === 1 ? '' : 's'})` : ''}` : 'nothing open'}</span></label>`;
+    $('#stlOptions').innerHTML =
+      opt('stlFronted', 'Pay-backs of fronted expenses', sum(fronted), fronted.length, true) +
+      opt('stlShare1', `${esc(payoutLabel('share1'))}'s share paid`, sum(perKind.share1), undefined, true) +
+      opt('stlShare2', `${esc(payoutLabel('share2'))}'s share paid`, sum(perKind.share2), undefined, true) +
+      opt('stlBuffer', 'Buffer set aside', sum(perKind.buffer), undefined, false) +
+      opt('stlTax', 'Tax reserve set aside', sum(perKind.tax), undefined, false);
+  };
+  $('#stlMonth').onchange = draw;
+  draw();
+  $('#stlSave').onclick = () => {
+    const idx = Number($('#stlMonth').value);
+    const { fronted, perKind } = plan(idx);
+    const picked = { fronted: $('#stlFronted').checked, share1: $('#stlShare1').checked, share2: $('#stlShare2').checked, buffer: $('#stlBuffer').checked, tax: $('#stlTax').checked };
+    if (!Object.values(picked).some(Boolean)) return snack('Tick at least one item');
+    showConfirm(`Mark the ticked items as settled up to and including ${months[idx].label}? The bank balance stays the same.`, async () => {
+      const now = Date.now();
+      if (picked.fronted) for (const p of fronted) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: p.receivedAt, offBook: true });
+      for (const k of PAYOUT_KINDS) {
+        if (!picked[k]) continue;
+        for (const { m, amount } of perKind[k]) {
+          await DB.add('payouts', { kind: k, amount, periodStart: m.start, periodEnd: m.end, periodLabel: m.label, paidAt: now, offBook: true, note: 'settled earlier' });
+        }
+      }
+      closeSheet(); snack(`Settled up to ${months[idx].label}`); render();
+    }, 'Mark settled');
+  };
 }
 
 function recordPayout(kind, amount, per) {
@@ -1041,13 +1148,9 @@ function openBufferWithdraw(available) {
 async function renderSplit() {
   const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
   const per = computePeriod();
-  const cfg = splitCfg();
-
-  const revenue = orders.filter(o => o.createdAt >= per.start && o.createdAt < per.end)
-    .reduce((s, o) => s + o.total, 0);
-  const costs = purchases.filter(pu => pu.receivedAt >= per.start && pu.receivedAt < per.end)
-    .reduce((s, pu) => s + (pu.amount || 0), 0);
-  const sp = computeSplit(revenue, costs, cfg);
+  // Percentages as they were at the end of this period (or now).
+  const cfg = splitCfgAt(Math.min(per.end - 1, Date.now()));
+  const sp = computeSplitBetween(orders, purchases, per.start, per.end);
   const { base, tax, afterTax, reserve, toSplit, share1, share2 } = sp;
   const fmtSigned = n => n < 0 ? '−' + fmtMoney(-n) : fmtMoney(n);
 
@@ -1059,7 +1162,7 @@ async function renderSplit() {
     const list = paidHere[kind], paid = list.reduce((t, x) => t + x.amount, 0), left = due[kind] - paid;
     const done = isShareKind(kind) ? 'Paid' : 'Set aside';
     if (due[kind] <= 0 && !paid) return '';
-    if (left <= 0) return `<button class="pay-status is-done" ${isAdmin() ? `data-undo="${kind}"` : 'disabled'}>✓ ${done} ${fmtMoney(paid)} · ${fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
+    if (left <= 0) return `<button class="pay-status is-done" ${isAdmin() ? `data-undo="${kind}"` : 'disabled'}>✓ ${done} ${fmtMoney(paid)} · ${list.every(x => x.offBook) ? 'settled earlier' : fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
     if (!isAdmin()) return `<span class="pay-status is-open">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}${fmtMoney(left)} not ${isShareKind(kind) ? 'paid' : 'set aside'} yet</span>`;
     return `<button class="pay-status" data-pay="${kind}" data-amount="${left}">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}Mark ${fmtMoney(left)} ${isShareKind(kind) ? 'paid' : 'set aside'}</button>`;
   };
@@ -1131,6 +1234,7 @@ async function renderSplit() {
       </div>
     </div>
     ${base <= 0 ? '<div class="sub" style="font-size:13px;color:var(--md-on-surface-variant);margin-top:10px">No positive amount this period — nothing is set aside or distributed.</div>' : ''}
+    ${sp.changedAt.length ? `<div class="admin-hint">Percentages changed on ${sp.changedAt.map(t => fmtDate(t) + ' ' + fmtTime(t)).join(', ')} — sales before that use the old percentages; the % shown are the newest.</div>` : ''}
     <h2 class="section-label">Totals · all time</h2>
     <div class="card totals-card">
       ${['share1', 'share2'].map(k => `
@@ -1157,7 +1261,7 @@ async function renderSplit() {
     <div class="card">
       ${history.map(x => `
         <button class="flow-row payout-row" data-payout="${x.id}" ${isAdmin() ? '' : 'disabled'}>
-          <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${fmtDate(x.paidAt)}</small></span>
+          <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${x.offBook ? 'settled earlier' : fmtDate(x.paidAt)}</small></span>
           <span>${x.withdrawal ? '−' : ''}${fmtMoney(x.amount)}</span>
         </button>`).join('')}
     </div>` : ''}
@@ -1213,19 +1317,38 @@ function openSplitSettings() {
         <label class="field"><span>Name first share</span><input id="spName1" value="${esc(cfg.name1)}"></label>
         <label class="field"><span>Name second share</span><input id="spName2" value="${esc(cfg.name2)}"></label>
       </div>
+      <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant)">New percentages apply from the moment you save. Everything sold before keeps the percentages that applied then.</div>
       <button class="btn-filled" id="spSave">Save</button>
+      ${(cfg.previous || []).length ? `
+      <h2 class="section-label" style="margin:8px 0 0">Earlier percentages</h2>
+      <div class="card">
+        ${cfg.previous.slice().reverse().map(p => `
+          <div class="flow-row"><span>until ${fmtDate(p.until)} ${fmtTime(p.until)}</span>
+          <span style="font-size:13px">${p.base === 'revenue' ? 'revenue' : 'profit'} · tax ${p.taxPct}% · buffer ${p.resPct}% · ${esc(cfg.name1)} ${p.sharePct}%</span></div>`).join('')}
+      </div>` : ''}
     </div>`);
   $('#spSave').onclick = () => {
     const clampPct = v => Math.min(100, Math.max(0, Number(v) || 0));
-    shared.setItem('erp_split_cfg', JSON.stringify({
+    const next = {
       base: $('#spBase').value,
       taxPct: clampPct($('#spTax').value),
       resPct: clampPct($('#spRes').value),
-      sharePct: clampPct($('#spShare').value),
+      sharePct: clampPct($('#spShare').value)
+    };
+    const previous = [...(cfg.previous || [])];
+    const changed = ['base', 'taxPct', 'resPct', 'sharePct'].some(k => next[k] !== cfg[k]);
+    // Keep the old percentages for everything before now (only if anything
+    // was ever calculated with them, i.e. not on a brand-new setup).
+    if (changed && shared.getItem('erp_split_cfg')) {
+      previous.push({ until: Date.now(), base: cfg.base, taxPct: cfg.taxPct, resPct: cfg.resPct, sharePct: cfg.sharePct });
+    }
+    shared.setItem('erp_split_cfg', JSON.stringify({
+      ...next,
       name1: $('#spName1').value.trim() || 'Share 1',
-      name2: $('#spName2').value.trim() || 'Share 2'
+      name2: $('#spName2').value.trim() || 'Share 2',
+      previous
     }));
-    closeSheet(); snack('Split settings saved'); renderSplit();
+    closeSheet(); snack(changed ? 'New percentages apply from now on' : 'Split settings saved'); render();
   };
 }
 
@@ -1236,14 +1359,15 @@ const paidByLabel = pb => {
   return pb === 'p1' ? cfg.name1 : pb === 'p2' ? cfg.name2 : 'Company';
 };
 const isPersonal = p => p.paidBy === 'p1' || p.paidBy === 'p2';
-const hitsBank = p => !isPersonal(p) || p.reimbursed;
+// offBook: settled outside the app (before it was tracked) — never touches the bank.
+const hitsBank = p => !isPersonal(p) || (p.reimbursed && !p.offBook);
 /* When an expense leaves the bank: company-paid on the expense date; fronted
    by a person on the day the company paid them back (older records without
    that date fall back to the expense date). */
 const bankTs = p => (isPersonal(p) && p.reimbursedAt) || p.receivedAt;
 /* Money out of the bank since ts: expenses, reimbursements and profit
    shares paid out to the partners. (Tax and buffer stay company money.) */
-const isSharePayout = x => x.kind === 'share1' || x.kind === 'share2';
+const isSharePayout = x => (x.kind === 'share1' || x.kind === 'share2') && !x.offBook;
 const bankOutflowSince = (purchases, payouts, ts) =>
   purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0)
   + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
