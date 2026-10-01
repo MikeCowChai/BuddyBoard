@@ -642,3 +642,5 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .mf-in { color: var(--md-primary); }
 .mf-out { color: var(--md-tertiary); }
 .mf-net { font-weight: 700; }
+.flow-row.is-tappable { cursor: pointer; border-radius: var(--radius-s); }
+.flow-row.is-tappable:active { background: var(--md-surface-container-high); }
