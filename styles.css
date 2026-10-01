@@ -37,6 +37,10 @@
   --md-elev-1: 0 1px 2px rgba(0,0,0,.30), 0 1px 3px 1px rgba(0,0,0,.15);
   --md-elev-3: 0 4px 8px 3px rgba(0,0,0,.15), 0 1px 3px rgba(0,0,0,.30);
 
+  /* Referral chart series (validated: CVD + contrast on the card surface) */
+  --ref-direct: #4355B9;
+  --ref-indirect: #13926a;
+
   --radius-s: 8px;
   --radius-m: 12px;
   --radius-l: 16px;
@@ -45,6 +49,8 @@
 
 /* Dark tokens (forced via data-theme="dark") */
 :root[data-theme="dark"] {
+  --ref-direct: #5f6fd4;
+  --ref-indirect: #1aa775;
   --md-primary: #B9C3FF;
   --md-on-primary: #08218A;
   --md-primary-container: #2A3CA0;
@@ -78,6 +84,8 @@
 /* Dark tokens (system preference, unless light is forced) */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    --ref-direct: #5f6fd4;
+    --ref-indirect: #1aa775;
     --md-primary: #B9C3FF;
     --md-on-primary: #08218A;
     --md-primary-container: #2A3CA0;
@@ -645,3 +653,33 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .flow-row.is-tappable { cursor: pointer; border-radius: var(--radius-s); }
 .flow-row.is-tappable:active { background: var(--md-surface-container-high); }
 .stl-marked { margin-top: 6px; padding: 10px; border-radius: var(--radius-m); background: var(--md-tertiary-container); color: var(--md-on-tertiary-container); }
+
+/* ---- Referral revenue: chart + tree ---- */
+.ref-legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--md-on-surface-variant); margin: 2px 0 10px; }
+.ref-legend i, .ref-key { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.ref-key.d, .ref-legend i.d { background: var(--ref-direct); }
+.ref-key.i, .ref-legend i.i { background: var(--ref-indirect); }
+.ref-chart { position: relative; }
+.ref-bar-row { display: grid; grid-template-columns: minmax(0, 34%) 1fr; gap: 10px; align-items: center; padding: 6px 0; cursor: pointer; }
+.ref-bar-name { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--md-on-surface); }
+.ref-bar-name small { color: var(--md-on-surface-variant); }
+.ref-bar-track { display: flex; align-items: center; gap: 0; min-width: 0; }
+.ref-seg { height: 14px; flex: none; }
+.ref-seg.d { background: var(--ref-direct); }
+.ref-seg.i { background: var(--ref-indirect); margin-left: 2px; }
+.ref-seg.end { border-radius: 0 4px 4px 0; }
+.ref-seg.i.first { margin-left: 0; }
+.ref-bar-val { margin-left: 8px; font-size: 12.5px; font-weight: 600; color: var(--md-on-surface); white-space: nowrap; flex: none; }
+.ref-tip {
+  position: absolute; z-index: 5; pointer-events: none; max-width: 240px;
+  background: var(--md-inverse-surface); color: var(--md-inverse-on-surface);
+  font-size: 12.5px; line-height: 1.45; padding: 7px 10px; border-radius: var(--radius-s); box-shadow: var(--md-elev-1);
+}
+.ref-tree { list-style: none; margin: 0; padding: 0; }
+.ref-tree .ref-tree { margin-left: 14px; padding-left: 10px; border-left: 2px solid var(--md-outline-variant); }
+.ref-node { display: flex; justify-content: space-between; gap: 10px; width: 100%; text-align: left; padding: 7px 4px; font-size: 14px; border-radius: var(--radius-s); }
+.ref-node:active { background: var(--md-surface-container-high); }
+.ref-node small { color: var(--md-on-surface-variant); }
+.ref-node .amt { flex: none; font-weight: 600; }
+.ref-totals { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--md-on-surface-variant); padding: 10px 4px 2px; border-top: 1px solid var(--md-outline-variant); margin-top: 6px; }
+.ref-totals b { color: var(--md-on-surface); }
