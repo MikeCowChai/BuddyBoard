@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.8.1';
+const BUILD = '2.9.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -240,6 +240,13 @@ ${isAdmin() ? `      <button class="set-row" id="setBank" >
         </div>
         <span class="set-chevron">›</span>
       </button>
+      ${isAdmin() ? `<button class="set-row" id="stSources">
+        <div class="set-main">
+          <div class="set-title">Customer sources</div>
+          <div class="set-sub">organic vs referred, best referrers</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>` : ''}
       <button class="set-row" id="stImport" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
           <div class="set-title">Import backup… ${isAdmin() ? '' : ADMIN_NOTE}</div>
@@ -311,6 +318,7 @@ ${isAdmin() ? `      <button class="set-row" id="setBank" >
   };
 
   $('#stImport').onclick = () => { if (requireAdmin()) $('#stImportFile').click(); };
+  if ($('#stSources')) $('#stSources').onclick = () => openCustomerSources();
   $('#stImportFile').onchange = async e => {
     const f = e.target.files[0];
     e.target.value = '';
@@ -326,6 +334,7 @@ ${isAdmin() ? `      <button class="set-row" id="setBank" >
       async () => {
         await DB.importAll(data);
         await ensureOrderSeq(); // v1 backups have no seq numbers — assign them now
+        await ensureCustomerNos();
         if (data.settings) {
           if (data.settings.theme) applyTheme(data.settings.theme);
           if (data.settings.receiptFooter != null) shared.setItem('erp_receipt_footer', data.settings.receiptFooter);
@@ -2210,12 +2219,14 @@ function attachCustomerPicker({ input, drop, customers, allowNew, onPick, onType
   const render = () => {
     const t = input.value.trim().toLowerCase();
     const hits = customers
-      .filter(c => !t || c.name.toLowerCase().includes(t) || (c.phone || '').includes(t))
+      .filter(c => customerMatches(c, t))
+      // an exact customer-number match ("12", "c12") goes first
+      .sort((a, b) => (Number(b.no) === Number(t.replace(/^c/, '')) && /\d/.test(t)) - (Number(a.no) === Number(t.replace(/^c/, '')) && /\d/.test(t)))
       .slice(0, 6);
     const exact = customers.some(c => c.name.toLowerCase() === t);
     drop.innerHTML =
       (allowNew && t && !exact ? `<div class="combo-item combo-new" data-new>＋ Create “${esc(input.value.trim())}” as new customer</div>` : '') +
-      hits.map(c => `<div class="combo-item" data-cid="${c.id}"><div>${esc(c.name)}</div>${c.phone ? `<div class="sub">${esc(c.phone)}</div>` : ''}</div>`).join('') +
+      hits.map(c => `<div class="combo-item" data-cid="${c.id}"><div>${esc(c.name)}</div>${c.phone || c.no ? `<div class="sub">${[custNo(c), esc(c.phone || '')].filter(Boolean).join(' · ')}</div>` : ''}</div>`).join('') +
       (!hits.length && !allowNew ? '<div class="combo-item" style="color:var(--md-on-surface-variant)">No matching customers</div>' : '');
     drop.hidden = false;
     drop.querySelectorAll('[data-cid]').forEach(el => el.addEventListener('pointerdown', e => {
@@ -2656,7 +2667,8 @@ async function openOrderForm() {
         customerName = typed;
         customerId = await DB.add('customers', {
           name: customerName, phone, email: $('#ofEmail').value.trim(),
-          address, createdAt: Date.now(), referredBy: referredBy || undefined
+          address, createdAt: Date.now(), referredBy: referredBy || undefined,
+          no: nextCustomerNo(await DB.getAll('customers'))
         });
       }
     }
@@ -2741,7 +2753,7 @@ async function renderCustomers() {
     </div>` : '';
 
   const list = all
-    .filter(c => c.name.toLowerCase().includes(q) || (c.address || '').toLowerCase().includes(q) || (c.phone || '').includes(q))
+    .filter(c => customerMatches(c, q) || (c.address || '').toLowerCase().includes(q))
     .sort((a, b) => b.spent - a.spent);
 
   $('#customerList').innerHTML = list.map(c => `
@@ -2751,7 +2763,7 @@ async function renderCustomers() {
         <div class="row">
           <div class="row-main">
             <div class="name">${esc(c.name)}</div>
-            <div class="sub">${esc(c.phone || 'No phone on file')}</div>
+            <div class="sub">${[custNo(c), esc(c.phone || 'No phone on file')].filter(Boolean).join(' · ')}</div>
             ${c.via || c.brought || c.discountPct > 0 ? `<div class="ref-tags">
               ${c.via ? `<span class="ref-tag">via ${esc(c.via)}</span>` : ''}
               ${c.brought ? `<span class="ref-tag is-star">★ brought ${c.brought}</span>` : ''}
@@ -2785,13 +2797,17 @@ async function openCustomerDetail(id) {
   const chainRevenue = [...chain].reduce((s, cid) => s + spentBy(cid), 0);
   openSheet(`
     <h2>${esc(c.name)}</h2>
-    <div class="sub" style="color:var(--md-on-surface-variant);margin:-8px 0 2px">${esc(c.phone || 'No phone on file')}${c.email ? ' · ' + esc(c.email) : ''}</div>
+    <div class="sub" style="color:var(--md-on-surface-variant);margin:-8px 0 2px">${custNo(c) ? `<b>${custNo(c)}</b> · ` : ''}${esc(c.phone || 'No phone on file')}${c.email ? ' · ' + esc(c.email) : ''}</div>
     <div class="sub" style="color:var(--md-on-surface-variant);margin:0 0 16px">${esc(c.address || 'No address on file')}</div>
     ${c.notes ? `<div class="card" style="margin-bottom:16px;background:var(--md-secondary-container);color:var(--md-on-secondary-container);font-size:14px">${esc(c.notes)}</div>` : ''}
     ${referrer || c.discountPct > 0 ? `<div class="chip-row" style="padding:0;margin:0 0 14px">
       ${referrer ? `<button class="chip ref-chip" data-open-customer="${referrer.id}">via ${esc(referrer.name)} ›</button>` : ''}
       ${c.discountPct > 0 ? `<span class="chip is-selected">${c.discountPct}% standard discount</span>` : ''}
     </div>` : ''}
+    <div class="chip-row" style="padding:0;margin:0 0 14px">
+      ${referrer ? '' : '<button class="chip" id="cdSetRef">＋ Set “referred by”</button>'}
+      <button class="chip" id="cdAddRef">＋ Link a customer they brought</button>
+    </div>
     <div class="stat-grid">
       <div class="stat-card"><div class="label">Total spent</div><div class="value" style="font-size:24px">${fmtMoney(spent)}</div></div>
       <div class="stat-card"><div class="label">Orders</div><div class="value" style="font-size:24px">${theirs.length}</div></div>
@@ -2828,11 +2844,132 @@ async function openCustomerDetail(id) {
     </div>`);
 
   $('#cdEdit').onclick = () => openCustomerForm(id);
+  if ($('#cdSetRef')) $('#cdSetRef').onclick = () => openLinkSheet(c, customers, 'referrer');
+  $('#cdAddRef').onclick = () => openLinkSheet(c, customers, 'referral');
   document.querySelectorAll('[data-open-customer]').forEach(b => b.onclick = () => openCustomerDetail(Number(b.dataset.openCustomer)));
   $('#cdDelete').onclick = () => showConfirm(`Delete customer “${c.name}”? Their past orders stay in the order list.`, async () => {
     await DB.delete('customers', id);
     closeSheet(); snack('Customer deleted'); render();
   });
+}
+
+/* Quick linking from a customer's detail:
+   mode 'referrer' → pick who sent c;  mode 'referral' → pick someone c brought in. */
+function openLinkSheet(c, customers, mode) {
+  const chainDown = referralChain(customers, c.id, new Set([c.id]));      // c + everyone c brought
+  const up = new Set(); for (let x = c; x && x.referredBy && !up.has(x.referredBy); x = customers.find(y => y.id === x.referredBy)) up.add(x.referredBy);
+  const candidates = customers
+    .filter(x => mode === 'referrer' ? !chainDown.has(x.id) : (x.id !== c.id && !up.has(x.id) && x.referredBy !== c.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  openSheet(`
+    <h2>${mode === 'referrer' ? `Who sent ${esc(c.name)}?` : `Who did ${esc(c.name)} bring in?`}</h2>
+    <p class="sheet-sub">Search by name, phone or customer number.</p>
+    <div class="form-card">
+      <label class="field" style="position:relative"><span>Customer</span>
+        <input id="lkSearch" placeholder="e.g. Lena or 12" autocomplete="off">
+        <div class="combo-drop" id="lkDrop" hidden></div>
+      </label>
+    </div>`);
+  attachCustomerPicker({
+    input: $('#lkSearch'), drop: $('#lkDrop'), customers: candidates, allowNew: false,
+    onPick: async x => {
+      if (mode === 'referrer') {
+        await DB.put('customers', { ...c, referredBy: x.id });
+        snack(`${c.name} — referred by ${x.name}`);
+      } else {
+        const prev = customers.find(y => y.id === x.referredBy);
+        const apply = async () => { await DB.put('customers', { ...x, referredBy: c.id }); snack(`${x.name} — brought in by ${c.name}`); openCustomerDetail(c.id); render(); };
+        if (prev) return showConfirm(`${x.name} is now linked to ${prev.name}. Change it to ${c.name}?`, apply, 'Change');
+        return apply();
+      }
+      openCustomerDetail(c.id); render();
+    }
+  });
+  $('#lkSearch').focus();
+}
+
+/* Admin overview (Settings → Customer sources): organic vs referred
+   customers, revenue from each, best referrers and new customers per month. */
+async function customerSources() {
+  const [customers, orders] = await Promise.all([DB.getAll('customers'), DB.getAll('orders')]);
+  const spentBy = id => orders.filter(o => o.customerId === id).reduce((t, o) => t + o.total, 0);
+  const referred = customers.filter(c => customers.some(x => x.id === c.referredBy));
+  const organic = customers.filter(c => !referred.includes(c));
+  const revOf = list => list.reduce((t, c) => t + spentBy(c.id), 0);
+  const referrers = customers.map(c => {
+    const direct = referralsOf(customers, c.id);
+    const chain = referralChain(customers, c.id);
+    return { c, direct: direct.length, chain: chain.size, revenue: [...chain].reduce((t, id) => t + spentBy(id), 0) };
+  }).filter(r => r.direct > 0).sort((a, b) => b.direct - a.direct || b.revenue - a.revenue);
+  const first = Math.min(...customers.map(c => c.createdAt || Date.now()));
+  const months = isFinite(first) ? monthsFrom(first, Date.now()).reverse().map(m => {
+    const added = customers.filter(c => (c.createdAt || 0) >= m.start && (c.createdAt || 0) < m.end);
+    return { label: m.label, organic: added.filter(c => organic.includes(c)).length, referred: added.filter(c => referred.includes(c)).length };
+  }).filter(m => m.organic + m.referred) : [];
+  return { customers, organic, referred, orgRev: revOf(organic), refRev: revOf(referred), referrers, months };
+}
+
+async function openCustomerSources() {
+  if (!requireAdmin()) return;
+  const d = await customerSources();
+  const pct = n => d.customers.length ? Math.round(n / d.customers.length * 100) + '%' : '0%';
+  openSheet(`
+    <h2>Customer sources</h2>
+    <p class="sheet-sub">Organic = came on their own · Referred = sent by another customer</p>
+    <div class="stat-grid">
+      <div class="stat-card"><div class="label">Organic</div><div class="value" style="font-size:24px">${d.organic.length}</div><div class="hint">${pct(d.organic.length)} · ${fmtMoney(d.orgRev)} revenue</div></div>
+      <div class="stat-card"><div class="label">Referred</div><div class="value" style="font-size:24px">${d.referred.length}</div><div class="hint">${pct(d.referred.length)} · ${fmtMoney(d.refRev)} revenue</div></div>
+    </div>
+    <h2 class="section-label">Best referrers</h2>
+    <div class="card">
+      ${d.referrers.slice(0, 15).map(r => `
+        <button class="flow-row ref-row" data-open-customer="${r.c.id}">
+          <span>${esc(r.c.name)} <small>${custNo(r.c)} · brought ${r.direct}${r.chain > r.direct ? ` (${r.chain} incl. theirs)` : ''}</small></span>
+          <span>${fmtMoney(r.revenue)} ›</span>
+        </button>`).join('') || '<div class="empty">No referrals recorded yet.</div>'}
+    </div>
+    <h2 class="section-label">New customers per month</h2>
+    <div class="card month-flows">
+      <div class="month-flow mf-head" style="grid-template-columns:1.6fr 1fr 1fr"><span>Month</span><span>Organic</span><span>Referred</span></div>
+      ${d.months.map(m => `<div class="month-flow" style="grid-template-columns:1.6fr 1fr 1fr"><span class="mf-name">${m.label}</span><span>${m.organic}</span><span>${m.referred}</span></div>`).join('') || '<div class="empty">No customers yet.</div>'}
+    </div>
+    <button class="btn-tonal" id="csXlsx" style="margin-top:14px">Download as Excel</button>`);
+  document.querySelectorAll('[data-open-customer]').forEach(b => b.onclick = () => openCustomerDetail(Number(b.dataset.openCustomer)));
+  $('#csXlsx').onclick = async () => {
+    const [orders] = await Promise.all([DB.getAll('orders')]);
+    const spentBy = id => orders.filter(o => o.customerId === id).reduce((t, o) => t + o.total, 0);
+    const byId = id => d.customers.find(c => c.id === id);
+    const rows = [['No.', 'Customer', 'Source', 'Referred by', 'Brought in', 'Joined', 'Spent'],
+      ...d.customers.slice().sort((a, b) => (a.no || 0) - (b.no || 0)).map(c => [custNo(c), c.name,
+        d.referred.includes(c) ? 'Referred' : 'Organic', byId(c.referredBy) ? `${byId(c.referredBy).name} (${custNo(byId(c.referredBy))})` : '',
+        referralsOf(d.customers, c.id).length, c.createdAt ? tsToDateInput(c.createdAt) : '', spentBy(c.id)])];
+    const summary = [['', 'Customers', 'Revenue'], ['Organic', d.organic.length, d.orgRev], ['Referred', d.referred.length, d.refRev], [],
+      ['Month', 'Organic', 'Referred'], ...d.months.map(m => [m.label, m.organic, m.referred])];
+    await saveFile(`BuddyBoard customer sources ${tsToDateInput(Date.now())}.xlsx`,
+      buildXlsx([{ name: 'Summary', rows: summary, widths: [22, 12, 12] }, { name: 'Customers', rows, widths: [8, 24, 10, 28, 10, 12, 10] }]), 'Overview');
+  };
+}
+
+/* ----- Customer numbers: C0001, C0002… in order of creation ----- */
+const custNo = c => Number.isFinite(c && c.no) ? 'C' + String(c.no).padStart(4, '0') : '';
+const nextCustomerNo = customers => customers.reduce((m, c) => Number.isFinite(c.no) ? Math.max(m, c.no) : m, 0) + 1;
+/* Search helper: name, phone or customer number ("12", "c12", "C0012"). */
+function customerMatches(c, term) {
+  const t = term.trim().toLowerCase();
+  if (!t) return true;
+  if (c.name.toLowerCase().includes(t) || (c.phone || '').includes(t)) return true;
+  const n = t.replace(/^c/, '');
+  return /^\d+$/.test(n) && Number.isFinite(c.no) && c.no === Number(n);
+}
+/* Give every customer without a number one, oldest first. Only the admin's
+   device does this, so two phones never hand out the same numbers. */
+async function ensureCustomerNos() {
+  if (!isAdmin()) return;
+  const customers = await DB.getAll('customers');
+  const missing = customers.filter(c => !Number.isFinite(c.no))
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || a.id - b.id);
+  let next = nextCustomerNo(customers);
+  for (const c of missing) await DB.put('customers', { ...c, no: next++ });
 }
 
 /* ----- Referrals: which customer brought in which ----- */
@@ -2903,7 +3040,8 @@ async function openCustomerForm(id) {
       notes: $('#cfNotes').value.trim(),
       referredBy: referredBy || undefined,
       discountPct: discountPct || undefined,
-      createdAt: c.createdAt || Date.now()
+      createdAt: c.createdAt || Date.now(),
+      no: Number.isFinite(c.no) ? c.no : nextCustomerNo(all)
     });
     closeSheet(); snack(id ? 'Customer saved' : 'Customer added'); render();
   };
@@ -2982,6 +3120,7 @@ async function seedSampleData() {
   });
   await DB.add('purchases', { description: 'Oak boards, 10 units', amount: 340, supplier: 'Northline Timber', receivedAt: Date.now() - day * 3 });
   await ensureOrderSeq(); // give the sample orders proper order numbers
+  await ensureCustomerNos();
 
   snack('Sample data loaded');
   render();
@@ -3040,5 +3179,5 @@ async function ensureMigrations() {
 
 Cloud.start();
 Cloud.ready
-  .then(() => Promise.all([ensureDeliveryProduct(), ensureOrderSeq(), ensureMigrations()]))
+  .then(() => Promise.all([ensureDeliveryProduct(), ensureOrderSeq(), ensureMigrations(), ensureCustomerNos()]))
   .then(() => switchView('home'));
