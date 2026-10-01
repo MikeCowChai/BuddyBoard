@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.7.0';
+const BUILD = '2.8.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -620,7 +620,7 @@ async function renderHome() {
   let bankBalance = null;
   const member = isAdmin() ? null : await memberFlows();
   if (bank) {
-    const inflow = orders.filter(o => o.createdAt >= bank.ts).reduce((s, o) => s + o.total, 0);
+    const inflow = bankInflowSince(orders, payouts, bank.ts);
     const outflow = bankOutflowSince(purchases, payouts, bank.ts);
     bankBalance = bank.amount + inflow - outflow;
   }
@@ -1190,7 +1190,7 @@ async function renderSplit() {
   const withdrawn = sum('buffer', true);
   const inBuffer = tot.buffer - withdrawn;
   const openAmt = k => Math.max(0, allDue[k] - tot[k]);
-  const history = payouts.slice().sort((a, b) => b.paidAt - a.paidAt).slice(0, 12);
+  const history = payouts.filter(x => !isDeposit(x)).sort((a, b) => b.paidAt - a.paidAt).slice(0, 12);
 
   $('#money-split').innerHTML = `
     <div class="chip-row" id="splitChips">
@@ -1384,6 +1384,12 @@ const bankTs = p => (isPersonal(p) && p.reimbursedAt) || p.receivedAt;
 /* Money out of the bank since ts: expenses, reimbursements and profit
    shares paid out to the partners. (Tax and buffer stay company money.) */
 const isSharePayout = x => (x.kind === 'share1' || x.kind === 'share2') && !x.offBook;
+/* Private money put into the company account (stored with the payouts,
+   kind 'deposit', so only the admin can record it). Not revenue. */
+const isDeposit = x => x.kind === 'deposit';
+const bankInflowSince = (orders, payouts, ts) =>
+  orders.filter(o => o.createdAt >= ts).reduce((s, o) => s + o.total, 0)
+  + payouts.filter(x => isDeposit(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
 const bankOutflowSince = (purchases, payouts, ts) =>
   purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0)
   + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
@@ -1406,7 +1412,7 @@ async function computeBank() {
   const cfg = bankCfg();
   if (!cfg) return null;
   const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
-  const inflow = orders.filter(o => o.createdAt >= cfg.ts).reduce((s, o) => s + o.total, 0);
+  const inflow = bankInflowSince(orders, payouts, cfg.ts);
   const outflow = bankOutflowSince(purchases, payouts, cfg.ts);
   return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases, payouts };
 }
@@ -1425,6 +1431,7 @@ function bankMoves(orders, purchases, payouts, ts) {
   });
   payouts.forEach(x => {
     if (isSharePayout(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
+    if (isDeposit(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Deposit from ${esc(x.from || 'private')}${x.note ? ': ' + esc(x.note) : ''}`, amt: x.amount, depositId: x.id });
   });
   return moves.sort((a, b) => b.ts - a.ts);
 }
@@ -1450,7 +1457,7 @@ function monthlyFlowsHTML(moves, fromTs) {
 const movesListHTML = moves => `
   <div class="card">
     ${moves.slice(0, 15).map(m => `
-      <div class="flow-row" style="padding:8px 4px">
+      <div class="flow-row ${m.depositId && isAdmin() ? 'is-tappable' : ''}" ${m.depositId && isAdmin() ? `data-deposit="${m.depositId}"` : ''} style="padding:8px 4px">
         <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.text}<span style="color:var(--md-on-surface-variant);font-size:12px"> · ${fmtDate(m.ts)}</span></span>
         <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
       </div>`).join('') || '<div class="empty">Nothing has moved yet.</div>'}
@@ -1497,7 +1504,7 @@ async function renderBank() {
       <div class="stat-card">
         <div class="label">In since baseline</div>
         <div class="value">${fmtMoney(inflow)}</div>
-        <div class="hint">orders</div>
+        <div class="hint">orders & deposits</div>
       </div>
       <div class="stat-card">
         <div class="label">Out since baseline</div>
@@ -1505,7 +1512,10 @@ async function renderBank() {
         <div class="hint">expenses, pay-backs, profit shares</div>
       </div>
     </div>
-    <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>
+    <div class="report-actions" style="margin:12px 0 0">
+      <button class="btn-tonal" id="bankDeposit">Add deposit…</button>
+      <button class="btn-tonal" id="bankUpdate">Update balance…</button>
+    </div>
     <h2 class="section-label">Per month</h2>
     ${monthlyFlowsHTML(moves, cfg.ts)}
     <h2 class="section-label">Movements since baseline</h2>
@@ -1514,6 +1524,41 @@ async function renderBank() {
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
   $('#bankUpdate').onclick = () => openBankSheet(balance);
+  $('#bankDeposit').onclick = () => openDepositSheet();
+  document.querySelectorAll('[data-deposit]').forEach(r => r.onclick = () => {
+    const x = payouts.find(y => y.id === Number(r.dataset.deposit));
+    showConfirm(`Delete the deposit of ${fmtMoney(x.amount)} from ${x.from || 'private'} (${fmtDate(x.paidAt)})?`, async () => {
+      await DB.delete('payouts', x.id); snack('Deposit deleted'); render();
+    });
+  });
+}
+
+/* Admin: record private money put into the company account. */
+function openDepositSheet() {
+  if (!requireAdmin()) return;
+  const cfg = splitCfg();
+  openSheet(`
+    <h2>Add deposit</h2>
+    <p class="sheet-sub">Private money put into the company account. It raises the bank balance (and what members see), but is not revenue.</p>
+    <div class="form-card">
+      <div class="field-row">
+        <label class="field"><span>Amount (฿)</span><input id="dpAmount" type="number" min="1" step="1" inputmode="numeric" placeholder="1000"></label>
+        <label class="field"><span>Date</span><input id="dpDate" type="date" value="${tsToDateInput(Date.now())}"></label>
+      </div>
+      <label class="field"><span>From</span>
+        <select id="dpFrom"><option>${esc(cfg.name1)}</option><option>${esc(cfg.name2)}</option><option value="">Other / private</option></select>
+      </label>
+      <label class="field"><span>Note (optional)</span><input id="dpNote" placeholder="e.g. extra for stock"></label>
+      <button class="btn-filled" id="dpSave">Add deposit</button>
+    </div>`);
+  $('#dpSave').onclick = async () => {
+    const amount = Math.round(Number($('#dpAmount').value));
+    const ts = dateInputToTs($('#dpDate').value);
+    if (!(amount > 0)) return snack('Enter an amount greater than 0');
+    if (!ts) return snack('Pick a date');
+    await DB.add('payouts', { kind: 'deposit', amount, from: $('#dpFrom').value, note: $('#dpNote').value.trim(), paidAt: ts, periodStart: ts, periodEnd: ts, periodLabel: fmtDate(ts) });
+    closeSheet(); snack(`Deposit of ${fmtMoney(amount)} added`); render();
+  };
 }
 
 async function renderMemberBank() {
@@ -1532,7 +1577,7 @@ async function renderMemberBank() {
       <div class="stat-card">
         <div class="label">In</div>
         <div class="value">${fmtMoney(d.inflow)}</div>
-        <div class="hint">orders</div>
+        <div class="hint">orders & deposits</div>
       </div>
       <div class="stat-card">
         <div class="label">Out</div>
