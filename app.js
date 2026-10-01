@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.6.0';
+const BUILD = '2.7.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -190,13 +190,20 @@ function openSettings() {
 
     <h2 class="section-label">Finance</h2>
     <div class="card set-card">
-      <button class="set-row" id="setBank" ${isAdmin() ? '' : 'disabled'}>
+${isAdmin() ? `      <button class="set-row" id="setBank" >
         <div class="set-main">
-          <div class="set-title">Bank balance ${isAdmin() ? '' : ADMIN_NOTE}</div>
+          <div class="set-title">Bank balance</div>
           <div class="set-sub">${bank ? 'baseline set ' + fmtDate(bank.ts) : 'not set up yet'}</div>
         </div>
         <span class="set-chevron">›</span>
-      </button>
+      </button>` : ''}
+      ${isAdmin() ? `<button class="set-row" id="setMemberZero">
+        <div class="set-main">
+          <div class="set-title">Member balance starts…</div>
+          <div class="set-sub">${memberZero() ? 'members see in & out since ' + fmtDate(memberZero()) : 'not set — members see no balance'}</div>
+        </div>
+        <span class="set-chevron">›</span>
+      </button>` : ''}
       <button class="set-row" id="setSettle" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
           <div class="set-title">Mark as settled up to… ${isAdmin() ? '' : ADMIN_NOTE}</div>
@@ -267,9 +274,10 @@ function openSettings() {
       document.querySelectorAll('[data-theme-pick]').forEach(x => x.classList.toggle('is-selected', x === c));
     }));
 
-  $('#setBank').onclick = () => openBankSheet();
+  if ($('#setBank')) $('#setBank').onclick = () => openBankSheet();
   $('#setSplit').onclick = () => openSplitSettings();
   $('#setSettle').onclick = () => openSettleSheet();
+  if ($('#setMemberZero')) $('#setMemberZero').onclick = () => openMemberZeroSheet();
   $('#setFooter').onclick = () => openFooterSheet();
   $('#stSignOut').onclick = () => showConfirm('Sign out of BuddyBoard on this device?', () => Cloud.signOut(), 'Sign out');
   $('#stRenumber').onclick = () => {
@@ -606,9 +614,11 @@ async function renderHome() {
   const outOfStock = products.filter(p => p.trackStock !== false && p.stock === 0).length;
   const awaiting = orders.filter(o => o.items.some(i => i.pendingQty > 0)).length;
 
-  // Live bank balance (only when tracking is set up).
-  const bank = bankCfg();
+  // Live bank balance (only when tracking is set up). Members see the
+  // balance since their start date instead of the real one.
+  const bank = isAdmin() ? bankCfg() : null;
   let bankBalance = null;
+  const member = isAdmin() ? null : await memberFlows();
   if (bank) {
     const inflow = orders.filter(o => o.createdAt >= bank.ts).reduce((s, o) => s + o.total, 0);
     const outflow = bankOutflowSince(purchases, payouts, bank.ts);
@@ -647,6 +657,12 @@ async function renderHome() {
         <div class="label">Bank balance (tracked)</div>
         <div class="value">${bankBalance < 0 ? '−' + fmtMoney(-bankBalance) : fmtMoney(bankBalance)}</div>
         <div class="hint">tap for movements & re-anchor</div>
+      </div>` : ''}
+      ${member ? `
+      <div class="stat-card tappable" data-goto="money" data-moneysub="bank" style="grid-column:1/-1">
+        <div class="label">Balance since ${fmtDate(member.zero)}</div>
+        <div class="value">${signedMoney(member.balance)}</div>
+        <div class="hint">+${fmtMoney(member.inflow)} in · −${fmtMoney(member.outflow)} out — tap for details</div>
       </div>` : ''}
       ${(lowStock + outOfStock) ? `
       <div class="stat-card warn tappable" data-goto="stock" data-stock="low" style="grid-column:1/-1">
@@ -1395,40 +1411,87 @@ async function computeBank() {
   return { cfg, inflow, outflow, balance: cfg.amount + inflow - outflow, orders, purchases, payouts };
 }
 
-async function renderBank() {
-  const data = await computeBank();
-  if (!data) {
-    $('#money-bank').innerHTML = `
-      <div class="empty">
-        <div class="title">Track your bank balance</div>
-        <div>Set your current balance once — every order and expense you log will then move it automatically.</div>
-        ${isAdmin() ? '<button class="btn-tonal" id="bankSetup">Set current balance</button>' : '<div class="admin-hint">The admin can set this up.</div>'}
-      </div>`;
-    if ($('#bankSetup')) $('#bankSetup').onclick = () => openBankSheet();
-    return;
-  }
-
-  const { cfg, inflow, outflow, balance, orders, purchases, payouts } = data;
-  // Ledger: everything that moved the balance since the baseline.
+/* Everything that moved money in or out of the company since ts:
+   orders in; company expenses, pay-backs and paid-out shares out. */
+function bankMoves(orders, purchases, payouts, ts) {
   const moves = [];
-  orders.forEach(o => { if (o.createdAt >= cfg.ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
+  orders.forEach(o => { if (o.createdAt >= ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
   purchases.forEach(p => {
-    if (hitsBank(p) && bankTs(p) >= cfg.ts) moves.push({
+    if (hitsBank(p) && bankTs(p) >= ts) moves.push({
       ts: bankTs(p),
       text: isPersonal(p) ? `Paid back to ${esc(paidByLabel(p.paidBy))}: ${esc(p.description)}` : esc(p.description),
       amt: -(p.amount || 0)
     });
   });
   payouts.forEach(x => {
-    if (isSharePayout(x) && x.paidAt >= cfg.ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
+    if (isSharePayout(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
   });
-  moves.sort((a, b) => b.ts - a.ts);
+  return moves.sort((a, b) => b.ts - a.ts);
+}
+const signedMoney = n => (n < 0 ? '−' : '') + fmtMoney(Math.abs(n));
+/* Month-by-month in / out / net table, newest month first. */
+function monthlyFlowsHTML(moves, fromTs) {
+  const rows = monthsFrom(fromTs, Date.now()).reverse().map(m => {
+    const inM = moves.filter(x => x.ts >= m.start && x.ts < m.end);
+    const inn = inM.filter(x => x.amt > 0).reduce((t, x) => t + x.amt, 0);
+    const out = -inM.filter(x => x.amt < 0).reduce((t, x) => t + x.amt, 0);
+    return `<div class="month-flow">
+      <span class="mf-name">${m.label}</span>
+      <span class="mf-in">+${fmtMoney(inn)}</span>
+      <span class="mf-out">−${fmtMoney(out)}</span>
+      <span class="mf-net">${signedMoney(inn - out)}</span>
+    </div>`;
+  });
+  return `<div class="card month-flows">
+    <div class="month-flow mf-head"><span>Month</span><span>In</span><span>Out</span><span>Net</span></div>
+    ${rows.join('')}
+  </div>`;
+}
+const movesListHTML = moves => `
+  <div class="card">
+    ${moves.slice(0, 15).map(m => `
+      <div class="flow-row" style="padding:8px 4px">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.text}<span style="color:var(--md-on-surface-variant);font-size:12px"> · ${fmtDate(m.ts)}</span></span>
+        <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
+      </div>`).join('') || '<div class="empty">Nothing has moved yet.</div>'}
+  </div>`;
+
+/* What a member sees instead of the real bank balance: a balance that
+   starts at 0 on a date the admin picks (erp_member_zero). */
+const memberZero = () => Number(shared.getItem('erp_member_zero')) || null;
+async function memberFlows() {
+  const zero = memberZero();
+  if (!zero) return null;
+  const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
+  const moves = bankMoves(orders, purchases, payouts, zero);
+  const inflow = moves.filter(x => x.amt > 0).reduce((t, x) => t + x.amt, 0);
+  const outflow = -moves.filter(x => x.amt < 0).reduce((t, x) => t + x.amt, 0);
+  return { zero, moves, inflow, outflow, balance: inflow - outflow };
+}
+
+async function renderBank() {
+  if (!isAdmin()) return renderMemberBank();
+  const data = await computeBank();
+  if (!data) {
+    $('#money-bank').innerHTML = `
+      <div class="empty">
+        <div class="title">Track your bank balance</div>
+        <div>Set your current balance once — every order and expense you log will then move it automatically.</div>
+        <button class="btn-tonal" id="bankSetup">Set current balance</button>
+      </div>`;
+    $('#bankSetup').onclick = () => openBankSheet();
+    return;
+  }
+
+  const { cfg, inflow, outflow, balance, orders, purchases, payouts } = data;
+  const moves = bankMoves(orders, purchases, payouts, cfg.ts);
+  const zero = memberZero();
 
   $('#money-bank').innerHTML = `
     <div class="stat-grid">
       <div class="stat-card hero">
         <div class="label">Bank balance (tracked)</div>
-        <div class="value">${balance < 0 ? '−' + fmtMoney(-balance) : fmtMoney(balance)}</div>
+        <div class="value">${signedMoney(balance)}</div>
         <div class="hint">baseline ${fmtMoney(cfg.amount)} set ${fmtDate(cfg.ts)} ${fmtTime(cfg.ts)}</div>
       </div>
       <div class="stat-card">
@@ -1442,18 +1505,65 @@ async function renderBank() {
         <div class="hint">expenses, pay-backs, profit shares</div>
       </div>
     </div>
-    ${isAdmin() ? '<button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>' : ''}
+    <button class="btn-tonal" id="bankUpdate" style="margin-top:12px">Update balance…</button>
+    <h2 class="section-label">Per month</h2>
+    ${monthlyFlowsHTML(moves, cfg.ts)}
     <h2 class="section-label">Movements since baseline</h2>
-    <div class="card">
-      ${moves.slice(0, 15).map(m => `
-        <div class="flow-row" style="padding:8px 4px">
-          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.text}<span style="color:var(--md-on-surface-variant);font-size:12px"> · ${fmtDate(m.ts)}</span></span>
-          <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
-        </div>`).join('') || '<div class="empty">Nothing has moved the balance yet.</div>'}
-    </div>
+    ${movesListHTML(moves)}
+    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">${zero ? `Members don't see this balance — they see in &amp; out since ${fmtDate(zero)} (Settings → Member balance starts…).` : 'Members don\'t see this balance. Set a start date for what they see in Settings → Member balance starts….'}</div>
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
-  if ($('#bankUpdate')) $('#bankUpdate').onclick = () => openBankSheet(balance);
+  $('#bankUpdate').onclick = () => openBankSheet(balance);
+}
+
+async function renderMemberBank() {
+  const d = await memberFlows();
+  if (!d) {
+    $('#money-bank').innerHTML = `<div class="empty"><div class="title">Money in &amp; out</div><div>The admin hasn't set a start date yet.</div></div>`;
+    return;
+  }
+  $('#money-bank').innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-card hero">
+        <div class="label">Balance since ${fmtDate(d.zero)}</div>
+        <div class="value">${signedMoney(d.balance)}</div>
+        <div class="hint">started at ฿0 on ${fmtDate(d.zero)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">In</div>
+        <div class="value">${fmtMoney(d.inflow)}</div>
+        <div class="hint">orders</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Out</div>
+        <div class="value">${fmtMoney(d.outflow)}</div>
+        <div class="hint">expenses, pay-backs, profit shares</div>
+      </div>
+    </div>
+    <h2 class="section-label">Per month</h2>
+    ${monthlyFlowsHTML(d.moves, d.zero)}
+    <h2 class="section-label">Movements</h2>
+    ${movesListHTML(d.moves)}`;
+}
+
+/* Admin: from which day members' "balance" starts at ฿0. */
+function openMemberZeroSheet() {
+  if (!requireAdmin()) return;
+  const cur = memberZero() || (() => { const d = new Date(); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+  openSheet(`
+    <h2>Member balance starts…</h2>
+    <p class="sheet-sub">Members don't see the real bank balance. They see a balance that starts at ฿0 on this day, plus everything that came in and went out since.</p>
+    <div class="form-card">
+      <label class="field"><span>Start counting from (start of this day)</span><input type="date" id="mzDate" value="${tsToDateInput(cur)}"></label>
+      <button class="btn-filled" id="mzSave">Save</button>
+    </div>`);
+  $('#mzSave').onclick = () => {
+    const v = $('#mzDate').value;
+    if (!v) return snack('Pick a date');
+    const [y, m, d] = v.split('-').map(Number);
+    shared.setItem('erp_member_zero', String(new Date(y, m - 1, d).getTime()));
+    closeSheet(); snack(`Members now see money in & out since ${fmtDate(new Date(y, m - 1, d).getTime())}`); render();
+  };
 }
 
 function openBankSheet(prefill) {

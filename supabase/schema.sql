@@ -72,12 +72,17 @@ alter table public.records     enable row level security;
 alter table public.team        enable row level security;
 alter table public.applied_ops enable row level security;
 
--- The team can READ everything. All WRITES go through apply_ops below,
--- which checks who may change what — there is no other way in.
+-- The team can READ everything, except that only an admin sees the real
+-- bank balance (members see money in/out from their own start date).
+-- All WRITES go through apply_ops below, which checks who may change
+-- what — there is no other way in.
 drop policy if exists "team only" on public.records;
 drop policy if exists "team can read" on public.records;
 create policy "team can read" on public.records
-  for select to authenticated using (public.is_team());
+  for select to authenticated using (
+    public.is_team()
+    and (public.is_admin() or not (store = 'settings' and key = 'erp_bank'))
+  );
 drop policy if exists "team only" on public.applied_ops;
 -- (team and applied_ops have no policies: not reachable from the app.)
 
@@ -87,7 +92,7 @@ grant select on public.records to authenticated;
 -- Settings only an admin may change.
 create or replace function public.admin_setting(k text) returns boolean
 language sql immutable as $$
-  select k in ('erp_split_cfg', 'erp_receipt_footer', 'erp_bank');
+  select k in ('erp_split_cfg', 'erp_receipt_footer', 'erp_bank', 'erp_member_zero');
 $$;
 
 -- Apply a batch of changes from one device in ONE transaction: either

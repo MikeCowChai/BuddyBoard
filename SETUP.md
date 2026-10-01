@@ -55,6 +55,9 @@ Lukt het overzetten niet automatisch? Zet dan je backup terug via *Settings → 
   Op het apparaat geldt de nieuwe rol na één keer verversen.
 - Bestaand project van vóór 2.4.0: voer eenmalig [`supabase/upgrade-2.4.0-roles.sql`](supabase/upgrade-2.4.0-roles.sql) uit
   (zet onderaan het e-mailadres van je compagnon).
+- Een member ziet het echte banksaldo niet, maar een saldo dat op ฿0 begint op een startdatum
+  (admin: *Settings → Member balance starts…*). Bestaand project van vóór 2.7.0: voer eenmalig
+  [`supabase/upgrade-2.7.0-member-balance.sql`](supabase/upgrade-2.7.0-member-balance.sql) uit.
 
 ## Versienummers
 `MAJOR.MINOR.PATCH`, te zien onderaan in *Settings*:

@@ -629,3 +629,16 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .ref-row { width: 100%; text-align: left; }
 .ref-row small { color: var(--md-on-surface-variant); font-weight: 400; }
 .field-hint { margin-top: -6px; font-size: 12.5px; color: var(--md-primary); font-weight: 600; }
+
+/* ---- Money in / out per month ---- */
+.month-flow {
+  display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 6px; align-items: baseline;
+  padding: 8px 4px; font-size: 13.5px; border-bottom: 1px solid var(--md-outline-variant);
+}
+.month-flow:last-child { border-bottom: 0; }
+.month-flow > span:not(:first-child) { text-align: right; white-space: nowrap; }
+.mf-head { font-size: 12px; font-weight: 600; color: var(--md-on-surface-variant); }
+.mf-name { font-weight: 600; }
+.mf-in { color: var(--md-primary); }
+.mf-out { color: var(--md-tertiary); }
+.mf-net { font-weight: 700; }
