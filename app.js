@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.10.1';
+const BUILD = '2.11.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -538,6 +538,23 @@ function showConfirm(message, onConfirm, okLabel = 'Delete') {
   $('#confirmScrim').onclick = close;
   $('#confirmOk').onclick = () => { close(); onConfirm(); };
 }
+
+/* "Mark paid" — ask whether the money left the tracked bank account or was
+   paid some other way (cash, a private account…). onPick(offBook). */
+function askPaidHow(title, sub, onPick) {
+  openSheet(`
+    <h2>${esc(title)}</h2>
+    <p class="sheet-sub">${esc(sub)}</p>
+    <div class="form-card">
+      <button class="btn-filled" id="phBank">Paid from the bank<small style="display:block;font-weight:400;opacity:.85">comes off the bank balance today</small></button>
+      <button class="btn-tonal" id="phOff">Paid outside the bank<small style="display:block;font-weight:400;opacity:.85">cash or private account — bank balance stays the same</small></button>
+      <button class="btn-text" id="phCancel">Cancel</button>
+    </div>`);
+  $('#phBank').onclick = () => { closeSheet(); onPick(false); };
+  $('#phOff').onclick = () => { closeSheet(); onPick(true); };
+  $('#phCancel').onclick = closeSheet;
+}
+const offBookLabel = x => x.note || 'settled earlier';
 
 /* Swipe was removed — it fought with scrolling and mis-anchored sheets on
    Android. attachSwipe is now a no-op so existing call sites keep working;
@@ -1156,6 +1173,14 @@ async function openSettleSheet() {
 function recordPayout(kind, amount, per) {
   if (!requireAdmin()) return;
   const verb = isShareKind(kind) ? `Paid ${payoutLabel(kind)}` : `${payoutLabel(kind)} set aside`;
+  if (isShareKind(kind)) {
+    askPaidHow(`${verb}: ${fmtMoney(amount)}`, `Profit share for ${per.label}`, async offBook => {
+      await DB.add('payouts', { kind, amount, periodStart: per.start, periodEnd: per.end, periodLabel: per.label, paidAt: Date.now(),
+        ...(offBook ? { offBook: true, note: 'paid outside the bank' } : {}) });
+      snack(`${verb} — ${fmtMoney(amount)}${offBook ? ' (outside the bank)' : ''}`); render();
+    });
+    return;
+  }
   showConfirm(
     `${verb}: ${fmtMoney(amount)} for ${per.label}?${isShareKind(kind) ? ' This comes off the bank balance today.' : ''}`,
     async () => {
@@ -1203,7 +1228,7 @@ async function renderSplit() {
     const list = paidHere[kind], paid = list.reduce((t, x) => t + x.amount, 0), left = due[kind] - paid;
     const done = isShareKind(kind) ? 'Paid' : 'Set aside';
     if (due[kind] <= 0 && !paid) return '';
-    if (left <= 0) return `<button class="pay-status is-done" ${isAdmin() ? `data-undo="${kind}"` : 'disabled'}>✓ ${done} ${fmtMoney(paid)} · ${list.every(x => x.offBook) ? 'settled earlier' : fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
+    if (left <= 0) return `<button class="pay-status is-done" ${isAdmin() ? `data-undo="${kind}"` : 'disabled'}>✓ ${done} ${fmtMoney(paid)} · ${list.every(x => x.offBook) ? esc(offBookLabel(list[0])) : fmtDate(Math.max(...list.map(x => x.paidAt)))}</button>`;
     if (!isAdmin()) return `<span class="pay-status is-open">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}${fmtMoney(left)} not ${isShareKind(kind) ? 'paid' : 'set aside'} yet</span>`;
     return `<button class="pay-status" data-pay="${kind}" data-amount="${left}">${paid ? `${done} ${fmtMoney(paid)} · ` : ''}Mark ${fmtMoney(left)} ${isShareKind(kind) ? 'paid' : 'set aside'}</button>`;
   };
@@ -1303,7 +1328,7 @@ async function renderSplit() {
     <div class="card">
       ${history.map(x => `
         <button class="flow-row payout-row" data-payout="${x.id}" ${isAdmin() ? '' : 'disabled'}>
-          <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${x.offBook ? 'settled earlier' : fmtDate(x.paidAt)}</small></span>
+          <span>${x.withdrawal ? `Taken from buffer${x.note ? ': ' + esc(x.note) : ''}` : `${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`}<small> · ${x.offBook ? esc(offBookLabel(x)) + (x.note ? ' · ' + fmtDate(x.paidAt) : '') : fmtDate(x.paidAt)}</small></span>
           <span>${x.withdrawal ? '−' : ''}${fmtMoney(x.amount)}</span>
         </button>`).join('')}
     </div>` : ''}
@@ -1322,14 +1347,14 @@ async function renderSplit() {
     const title = x.withdrawal ? 'Taken from buffer' : `${payoutLabel(x.kind)} · ${x.periodLabel}`;
     openSheet(`
       <h2>${esc(title)}</h2>
-      <p class="sheet-sub">${fmtMoney(x.amount)} · ${x.offBook ? 'settled earlier (not via the tracked bank)' : 'recorded ' + fmtDate(x.paidAt)}</p>
+      <p class="sheet-sub">${fmtMoney(x.amount)} · ${x.offBook ? esc(offBookLabel(x)) + ' (not via the tracked bank)' : 'recorded ' + fmtDate(x.paidAt)}</p>
       <div class="form-card">
-        ${!x.withdrawal && !x.offBook ? `<button class="btn-tonal" id="poOffBook">It was settled earlier — take it out of the bank movements</button>` : ''}
+        ${!x.withdrawal && !x.offBook ? `<button class="btn-tonal" id="poOffBook">It was paid outside the bank — take it out of the bank movements</button>` : ''}
         ${!x.withdrawal && x.offBook ? `<button class="btn-tonal" id="poOnBook">It was paid from the bank on ${fmtDate(x.paidAt)}</button>` : ''}
         <button class="btn-text danger" id="poDelete">Delete record</button>
       </div>`);
-    if ($('#poOffBook')) $('#poOffBook').onclick = async () => { await DB.put('payouts', { ...x, offBook: true }); closeSheet(); snack('Marked as settled earlier'); render(); };
-    if ($('#poOnBook')) $('#poOnBook').onclick = async () => { await DB.put('payouts', { ...x, offBook: false }); closeSheet(); snack('Counted from the bank again'); render(); };
+    if ($('#poOffBook')) $('#poOffBook').onclick = async () => { await DB.put('payouts', { ...x, offBook: true, note: x.note || 'paid outside the bank' }); closeSheet(); snack('Marked as paid outside the bank'); render(); };
+    if ($('#poOnBook')) $('#poOnBook').onclick = async () => { const { note, ...rest } = x; await DB.put('payouts', { ...rest, offBook: false }); closeSheet(); snack('Counted from the bank again'); render(); };
     $('#poDelete').onclick = () => showConfirm(`Delete this record (${title}, ${fmtMoney(x.amount)})?`, async () => {
       await DB.delete('payouts', x.id); closeSheet(); snack('Record deleted'); render();
     });
@@ -1433,12 +1458,12 @@ const bankInflowSince = (orders, payouts, ts) =>
 const bankOutflowSince = (purchases, payouts, ts) =>
   purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0)
   + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
-/* Mark expenses as paid back by the company — from now on they count
-   against the bank balance, dated today. */
-async function markReimbursed(list) {
+/* Mark expenses as paid back, dated today. From the bank (default) they
+   count against the bank balance; offBook (cash / private) they never do. */
+async function markReimbursed(list, offBook = false) {
   if (!requireAdmin()) return;
   const now = Date.now();
-  for (const p of list) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: now });
+  for (const p of list) await DB.put('purchases', { ...p, reimbursed: true, reimbursedAt: now, offBook });
 }
 
 /* ----- MONEY: bank balance ----- */
@@ -1804,17 +1829,14 @@ async function renderPurchases() {
           <span>${esc(k === 'p1' ? cfg.name1 : cfg.name2)} fronted <b>${fmtMoney(owed[k])}</b></span>
           ${isAdmin() ? `<button class="btn-tonal owed-pay" data-payback="${k}">Pay back</button>` : ''}
         </div>`).join('')}
-      <div style="font-size:12px;opacity:.8;margin-top:6px">${isAdmin() ? '“Pay back” when the company has transferred the money — it then comes off the bank balance. To pay back a single expense, tap it in the list.' : 'The admin marks these as paid back once the company has transferred the money.'}</div>
+      <div style="font-size:12px;opacity:.8;margin-top:6px">${isAdmin() ? '“Pay back” once the money is paid — from the bank it comes off the bank balance, paid outside the bank (cash, private) it doesn’t. To pay back a single expense, tap it in the list.' : 'The admin marks these as paid back once the company has transferred the money.'}</div>
     </div>` : '';
   document.querySelectorAll('[data-payback]').forEach(btn => btn.onclick = () => {
     const who = btn.dataset.payback;
     const open = purchases.filter(p => p.paidBy === who && !p.reimbursed);
     const total = open.reduce((s, p) => s + (p.amount || 0), 0);
-    showConfirm(
-      `Company pays back ${paidByLabel(who)} ${fmtMoney(total)} (${open.length} expense${open.length === 1 ? '' : 's'})? This is taken off the bank balance today.`,
-      async () => { await markReimbursed(open); snack(`${paidByLabel(who)} paid back ${fmtMoney(total)}`); render(); },
-      'Pay back'
-    );
+    askPaidHow(`Pay back ${paidByLabel(who)} ${fmtMoney(total)}`, `${open.length} expense${open.length === 1 ? '' : 's'} fronted by ${paidByLabel(who)}`,
+      async offBook => { await markReimbursed(open, offBook); snack(`${paidByLabel(who)} paid back ${fmtMoney(total)}${offBook ? ' (outside the bank)' : ''}`); render(); });
   });
 
   let list = purchases;
@@ -1829,7 +1851,7 @@ async function renderPurchases() {
             <div class="name">${esc(p.description)}</div>
             <div class="sub">${cat(p)}${p.supplier ? ' · ' + esc(p.supplier) : ''} · ${fmtDate(p.receivedAt)}</div>
             ${isPersonal(p) ? (p.reimbursed
-              ? `<span class="badge badge-ok"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · reimbursed</span>`
+              ? `<span class="badge badge-ok"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · reimbursed${p.offBook ? ' outside the bank' : ''}</span>`
               : `<span class="badge badge-low"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · not reimbursed</span>`) : ''}
           </div>
           <div class="row-end"><div class="big">${fmtMoney(p.amount)}</div></div>
@@ -1848,16 +1870,22 @@ async function renderPurchases() {
       const canReimburse = isPersonal(p) && !p.reimbursed && isAdmin();
       openSheet(`
         <h2>${esc(p.description)}</h2>
-        <p class="sheet-sub">${fmtMoney(p.amount)} · ${esc(cat(p))} · ${fmtDate(p.receivedAt)}${isPersonal(p) ? ` · paid by ${esc(paidByLabel(p.paidBy))}${p.reimbursed ? ', paid back' : ''}` : ''}</p>
+        <p class="sheet-sub">${fmtMoney(p.amount)} · ${esc(cat(p))} · ${fmtDate(p.receivedAt)}${isPersonal(p) ? ` · paid by ${esc(paidByLabel(p.paidBy))}${p.reimbursed ? `, paid back ${p.offBook ? 'outside the bank' : 'from the bank'}` : ''}` : ''}</p>
         <div class="form-card">
           ${canReimburse ? `<button class="btn-tonal" id="ioReimburse">Pay back ${esc(paidByLabel(p.paidBy))} ${fmtMoney(p.amount)}</button>` : ''}
+          ${isPersonal(p) && p.reimbursed && isAdmin() ? `<button class="btn-tonal" id="ioBankToggle">${p.offBook ? 'It was paid back from the bank' : 'It was paid back outside the bank'}</button>` : ''}
           <button class="btn-tonal" id="ioEdit">Edit</button>
           <button class="btn-text danger" id="ioDelete">Delete</button>
         </div>`);
       const r = $('#ioReimburse');
-      if (r) r.onclick = async () => {
-        await markReimbursed([p]);
-        closeSheet(); snack(`Reimbursed — ${paidByLabel(p.paidBy)} is paid back ${fmtMoney(p.amount)}`); render();
+      if (r) r.onclick = () => askPaidHow(`Pay back ${paidByLabel(p.paidBy)} ${fmtMoney(p.amount)}`, p.description, async offBook => {
+        await markReimbursed([p], offBook);
+        snack(`Reimbursed — ${paidByLabel(p.paidBy)} is paid back ${fmtMoney(p.amount)}${offBook ? ' (outside the bank)' : ''}`); render();
+      });
+      const bt = $('#ioBankToggle');
+      if (bt) bt.onclick = async () => {
+        await DB.put('purchases', { ...p, offBook: !p.offBook });
+        closeSheet(); snack(p.offBook ? 'Counted from the bank again' : 'Taken out of the bank movements'); render();
       };
       $('#ioEdit').onclick = () => { closeSheet(); openPurchaseForm(p); };
       $('#ioDelete').onclick = () => { closeSheet(); confirmDelete(); };
@@ -1917,7 +1945,7 @@ function openPurchaseForm(p) {
     const reimbursedAt = reimbursed ? (p.reimbursed ? p.reimbursedAt : Date.now()) : undefined;
     await DB.put('purchases', {
       ...p, description, amount, category: $('#peCategory').value,
-      paidBy, reimbursed, reimbursedAt,
+      paidBy, reimbursed, reimbursedAt, offBook: reimbursed ? !!p.offBook : false,
       supplier: $('#peSupplier').value.trim(), receivedAt: ts
     });
     closeSheet();
