@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.14.1';
+const BUILD = '2.15.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -733,9 +733,12 @@ async function renderHome() {
 }
 
 /* ----- MONEY: reports ----- */
+/* Value of an amount of a product at its selling price (weight: per kg). */
+const stockLineValue = (p, qty) => p.unit === 'weight' ? Math.floor(qty / 1000 * (p.price || 0)) : qty * (p.price || 0);
+
 async function renderReports() {
-  const [orders, products, purchases] = await Promise.all([
-    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases')
+  const [orders, products, purchases, stocklog] = await Promise.all([
+    DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases'), DB.getAll('stocklog')
   ]);
   const now = new Date();
   const per = computePeriod();
@@ -748,7 +751,7 @@ async function renderReports() {
 
   const stockValue = products.reduce((s, p) => {
     if (p.trackStock === false) return s;
-    return s + (p.unit === 'weight' ? Math.floor(p.stock / 1000 * (p.price || 0)) : p.stock * (p.price || 0));
+    return s + stockLineValue(p, p.stock);
   }, 0);
 
   const monthly = [...Array(6)].map((_, k) => {
@@ -756,9 +759,11 @@ async function renderReports() {
     const e = new Date(now.getFullYear(), now.getMonth() - 4 + k, 1).getTime();
     const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((sum, o) => sum + o.total, 0);
     const cost = purchases.filter(pu => pu.receivedAt >= s && pu.receivedAt < e).reduce((sum, pu) => sum + (pu.amount || 0), 0);
-    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), rev, cost, current: k === 5 };
+    const made = stocklog.filter(x => x.ts >= s && x.ts < e).reduce((sum, x) => sum + (x.value || 0), 0);
+    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), rev, cost, made, current: k === 5 };
   });
-  const maxRev = Math.max(1, ...monthly.map(m => Math.max(m.rev, m.cost)));
+  const maxRev = Math.max(1, ...monthly.map(m => Math.max(m.rev, m.cost, m.made)));
+  const periodMade = stocklog.filter(x => x.ts >= per.start && x.ts < per.end).reduce((sum, x) => sum + (x.value || 0), 0);
 
   // Best & worst sellers — excludes items flagged out of reports (Delivery etc.)
   const perf = {};
@@ -814,8 +819,13 @@ async function renderReports() {
         <div class="value">${fmtMoney(stockValue)}</div>
         <div class="hint">stock × selling price</div>
       </div>
+      <div class="stat-card">
+        <div class="label">Stock made · ${per.label}</div>
+        <div class="value">${fmtMoney(periodMade)}</div>
+        <div class="hint">added to stock, at selling price</div>
+      </div>
     </div>
-    <h2 class="section-label">Revenue vs costs · last 6 months</h2>
+    <h2 class="section-label">Revenue, costs & stock made · last 6 months</h2>
     <div class="card">
       <div class="chart">
         ${monthly.map(m => `
@@ -824,6 +834,7 @@ async function renderReports() {
             <div class="chart-bars">
               <div class="chart-bar" style="height:${Math.round(m.rev / maxRev * 100)}%"></div>
               <div class="chart-bar cost" style="height:${Math.round(m.cost / maxRev * 100)}%"></div>
+              <div class="chart-bar stock" style="height:${Math.round(m.made / maxRev * 100)}%"></div>
             </div>
             <span class="chart-label">${m.label}</span>
           </div>`).join('')}
@@ -831,7 +842,9 @@ async function renderReports() {
       <div class="chart-legend">
         <span><span class="legend-dot rev"></span>Revenue</span>
         <span><span class="legend-dot cost"></span>Costs</span>
+        <span><span class="legend-dot stock"></span>Stock made</span>
       </div>
+      <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);text-align:center;margin-top:6px">Stock made = what you added with “Add stock”, at selling price. Not sold yet, so not in profit.</div>
     </div>
     ${catRows.length ? `
     <h2 class="section-label">Costs by category · ${per.label}</h2>
@@ -2006,6 +2019,9 @@ function openAddStockSheet(p) {
     const grams = isW ? ($('#asUnit').value === 'kg' ? Math.round(raw * 1000) : Math.round(raw)) : raw;
     const fresh = await DB.get('products', p.id);
     await DB.addStock(p.id, grams);
+    // Log it for the "stock made" bar in Reports (value at today's selling price).
+    await DB.add('stocklog', { productId: p.id, name: fresh.name, qty: grams, unitType: isW ? 'weight' : 'piece',
+      value: stockLineValue(fresh, grams), ts: Date.now() });
     // New stock first goes to orders that were waiting for it.
     let allocMsg = '';
     const allocations = await DB.allocatePending(p.id);
