@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.14.0';
+const BUILD = '2.14.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -1828,7 +1828,7 @@ async function renderPurchases() {
   purchases.forEach(p => { if (isPersonal(p) && !p.reimbursed) owed[p.paidBy] += (p.amount || 0); });
   const owedTotal = owed.p1 + owed.p2;
   $('#owedCard').innerHTML = owedTotal > 0 ? `
-    <div class="card" style="margin-top:12px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">
+    <div class="card" style="margin:12px 0 16px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">
       <div style="font-weight:600;margin-bottom:4px">Outstanding reimbursements · ${fmtMoney(owedTotal)}</div>
       ${['p1', 'p2'].filter(k => owed[k] > 0).map(k => `
         <div class="row owed-row" style="font-size:14px">
