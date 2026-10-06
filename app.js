@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.13.2';
+const BUILD = '2.14.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -197,13 +197,6 @@ ${isAdmin() ? `      <button class="set-row" id="setBank" >
         </div>
         <span class="set-chevron">›</span>
       </button>` : ''}
-      ${isAdmin() ? `<button class="set-row" id="setMemberZero">
-        <div class="set-main">
-          <div class="set-title">Member balance starts…</div>
-          <div class="set-sub">${memberZero() ? 'members see in & out since ' + fmtDate(memberZero()) : 'not set — members see no balance'}</div>
-        </div>
-        <span class="set-chevron">›</span>
-      </button>` : ''}
       <button class="set-row" id="setSettle" ${isAdmin() ? '' : 'disabled'}>
         <div class="set-main">
           <div class="set-title">Mark as settled up to… ${isAdmin() ? '' : ADMIN_NOTE}</div>
@@ -284,7 +277,6 @@ ${isAdmin() ? `      <button class="set-row" id="setBank" >
   if ($('#setBank')) $('#setBank').onclick = () => openBankSheet();
   $('#setSplit').onclick = () => openSplitSettings();
   $('#setSettle').onclick = () => openSettleSheet();
-  if ($('#setMemberZero')) $('#setMemberZero').onclick = () => openMemberZeroSheet();
   $('#setFooter').onclick = () => openFooterSheet();
   $('#stSignOut').onclick = () => showConfirm('Sign out of BuddyBoard on this device?', () => Cloud.signOut(), 'Sign out');
   $('#stRenumber').onclick = () => {
@@ -585,6 +577,10 @@ function snack(msg) {
 
 /* ---------------- Rendering ---------------- */
 async function render() {
+  // Bank & cash are admin only; members get Reports, Split and Expenses.
+  const bankTab = document.querySelector('[data-moneytab="bank"]');
+  if (bankTab) bankTab.hidden = !isAdmin();
+  if (!isAdmin() && state.moneyTab === 'bank') setMoneyTab('reports');
   if (state.view === 'home') renderHome();
   if (state.view === 'orders') renderOrders();
   if (state.view === 'stock') { renderProducts(); renderStockOutlook(); }
@@ -652,11 +648,9 @@ async function renderHome() {
   const outOfStock = products.filter(p => p.trackStock !== false && p.stock === 0).length;
   const awaiting = orders.filter(o => o.items.some(i => i.pendingQty > 0)).length;
 
-  // Live bank balance (only when tracking is set up). Members see the
-  // balance since their start date instead of the real one.
+  // Live bank balance — admin only (members see profit, not money balances).
   const bank = isAdmin() ? bankCfg() : null;
   let bankBalance = null;
-  const member = isAdmin() ? null : await memberFlows();
   if (bank) {
     const inflow = bankInflowSince(orders, payouts, bank.ts);
     const outflow = bankOutflowSince(purchases, payouts, bank.ts);
@@ -695,12 +689,6 @@ async function renderHome() {
         <div class="label">Bank balance (tracked)</div>
         <div class="value">${bankBalance < 0 ? '−' + fmtMoney(-bankBalance) : fmtMoney(bankBalance)}</div>
         <div class="hint">tap for movements & re-anchor</div>
-      </div>` : ''}
-      ${member ? `
-      <div class="stat-card tappable" data-goto="money" data-moneysub="bank" style="grid-column:1/-1">
-        <div class="label">Balance since ${fmtDate(member.zero)}</div>
-        <div class="value">${signedMoney(member.balance)}</div>
-        <div class="hint">+${fmtMoney(member.inflow)} in · −${fmtMoney(member.outflow)} out — tap for details</div>
       </div>` : ''}
       ${(lowStock + outOfStock) ? `
       <div class="stat-card warn tappable" data-goto="stock" data-stock="low" style="grid-column:1/-1">
@@ -1567,39 +1555,8 @@ const movesListHTML = moves => `
       </div>`).join('') || '<div class="empty">Nothing has moved yet.</div>'}
   </div>`;
 
-/* What members see: the company's own money since the start date, counted
-   the same way as profit — orders in, every expense out on the day it was
-   made (whoever paid it, pin or cash), plus deposits, minus profit shares
-   paid out for periods after the start. Before any share is paid out this
-   equals the profit since the start date (+ deposits). How things were paid
-   (bank / cash / withdrawals / pay-backs) stays out of it on purpose. */
-function memberMoves(orders, purchases, payouts, ts) {
-  const moves = [];
-  orders.forEach(o => { if (o.createdAt >= ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
-  purchases.forEach(p => { if (p.receivedAt >= ts) moves.push({ ts: p.receivedAt, text: esc(p.description), amt: -(p.amount || 0) }); });
-  payouts.forEach(x => {
-    // A share for a period that ended before the start was earned before it.
-    if ((x.kind === 'share1' || x.kind === 'share2') && x.periodEnd > ts)
-      moves.push({ ts: Math.max(x.paidAt, ts), text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
-    if (isDeposit(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Deposit from ${esc(x.from || 'private')}${x.note ? ': ' + esc(x.note) : ''}`, amt: x.amount });
-  });
-  return moves.sort((a, b) => b.ts - a.ts);
-}
-/* What a member sees instead of the real bank balance: a balance that
-   starts at 0 on a date the admin picks (erp_member_zero). */
-const memberZero = () => Number(shared.getItem('erp_member_zero')) || null;
-async function memberFlows() {
-  const zero = memberZero();
-  if (!zero) return null;
-  const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
-  const moves = memberMoves(orders, purchases, payouts, zero);
-  const inflow = moves.filter(x => x.amt > 0).reduce((t, x) => t + x.amt, 0);
-  const outflow = -moves.filter(x => x.amt < 0).reduce((t, x) => t + x.amt, 0);
-  return { zero, moves, inflow, outflow, balance: inflow - outflow };
-}
-
 async function renderBank() {
-  if (!isAdmin()) return renderMemberBank();
+  if (!isAdmin()) { $('#money-bank').innerHTML = ''; return; }
   const data = await computeBank();
   if (!data) {
     $('#money-bank').innerHTML = `
@@ -1615,7 +1572,6 @@ async function renderBank() {
   const { cfg, inflow, outflow, balance, orders, purchases, payouts } = data;
   const moves = bankMoves(orders, purchases, payouts, cfg.ts);
   const cash = cashBox(purchases, payouts);
-  const zero = memberZero();
 
   $('#money-bank').innerHTML = `
     <div class="stat-grid">
@@ -1650,7 +1606,7 @@ async function renderBank() {
     <h2 class="section-label">Movements since baseline</h2>
     ${movesListHTML(moves)}
     ${cash.used ? `<h2 class="section-label">Cash · ${signedMoney(cash.balance)} on hand</h2>${movesListHTML(cash.moves)}` : ''}
-    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">${zero ? `Members don't see this balance — they see in &amp; out since ${fmtDate(zero)} (Settings → Member balance starts…).` : 'Members don\'t see this balance. Set a start date for what they see in Settings → Member balance starts….'}</div>
+    <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Only you (admin) see the bank and cash. Members see profit in Reports and their share in Split.</div>
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
   $('#bankUpdate').onclick = () => openBankSheet(balance);
@@ -1723,56 +1679,6 @@ function openCashSheet(onHand = 0) {
     const toBank = $('#csDir').value === 'back';
     await DB.add('payouts', { kind: 'cash', amount, ...(toBank ? { toBank: true } : {}), note: $('#csNote').value.trim(), paidAt: ts, periodStart: ts, periodEnd: ts, periodLabel: fmtDate(ts) });
     closeSheet(); snack(toBank ? `${fmtMoney(amount)} cash put back in the bank` : `${fmtMoney(amount)} withdrawn — now in the cash box`); render();
-  };
-}
-
-async function renderMemberBank() {
-  const d = await memberFlows();
-  if (!d) {
-    $('#money-bank').innerHTML = `<div class="empty"><div class="title">Money in &amp; out</div><div>The admin hasn't set a start date yet.</div></div>`;
-    return;
-  }
-  $('#money-bank').innerHTML = `
-    <div class="stat-grid">
-      <div class="stat-card hero">
-        <div class="label">Balance since ${fmtDate(d.zero)}</div>
-        <div class="value">${signedMoney(d.balance)}</div>
-        <div class="hint">started at ฿0 on ${fmtDate(d.zero)}</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">In</div>
-        <div class="value">${fmtMoney(d.inflow)}</div>
-        <div class="hint">orders & deposits</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Out</div>
-        <div class="value">${fmtMoney(d.outflow)}</div>
-        <div class="hint">expenses & profit shares paid out</div>
-      </div>
-    </div>
-    <h2 class="section-label">Per month</h2>
-    ${monthlyFlowsHTML(d.moves, d.zero)}
-    <h2 class="section-label">Movements</h2>
-    ${movesListHTML(d.moves)}`;
-}
-
-/* Admin: from which day members' "balance" starts at ฿0. */
-function openMemberZeroSheet() {
-  if (!requireAdmin()) return;
-  const cur = memberZero() || (() => { const d = new Date(); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d.getTime(); })();
-  openSheet(`
-    <h2>Member balance starts…</h2>
-    <p class="sheet-sub">Members don't see the real bank balance. They see a balance that starts at ฿0 on this day, plus everything that came in and went out since.</p>
-    <div class="form-card">
-      <label class="field"><span>Start counting from (start of this day)</span><input type="date" id="mzDate" value="${tsToDateInput(cur)}"></label>
-      <button class="btn-filled" id="mzSave">Save</button>
-    </div>`);
-  $('#mzSave').onclick = () => {
-    const v = $('#mzDate').value;
-    if (!v) return snack('Pick a date');
-    const [y, m, d] = v.split('-').map(Number);
-    shared.setItem('erp_member_zero', String(new Date(y, m - 1, d).getTime()));
-    closeSheet(); snack(`Members now see money in & out since ${fmtDate(new Date(y, m - 1, d).getTime())}`); render();
   };
 }
 
