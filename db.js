@@ -18,7 +18,9 @@
    out the same id.
    ============================================================ */
 const DB = (() => {
-  const STORES = ['products', 'customers', 'orders', 'purchases', 'payouts'];
+  // stocklog: one row per "Add stock" — when, how much, and its value at the
+// selling price then — so reports can show how much stock was made per month.
+const STORES = ['products', 'customers', 'orders', 'purchases', 'payouts', 'stocklog'];
   const cache = Object.fromEntries(STORES.map(s => [s, new Map()]));
   let settings = {};
   let outbox = [];                 // [{ seq, op }] in upload order
@@ -422,8 +424,8 @@ const DB = (() => {
 
     /* Full backup: every store in one JSON-able object. */
     async exportAll() {
-      const [products, customers, orders, purchases, payouts] = await Promise.all(STORES.map(s => api.getAll(s)));
-      return { app: 'buddyboard', version: 1, exportedAt: Date.now(), products, customers, orders, purchases, payouts };
+      const all = await Promise.all(STORES.map(s => api.getAll(s)));
+      return { app: 'buddyboard', version: 1, exportedAt: Date.now(), ...Object.fromEntries(STORES.map((s, i) => [s, all[i]])) };
     },
 
     /* Restore a backup: REPLACES all shared data in every store the backup
