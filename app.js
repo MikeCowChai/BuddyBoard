@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.13.0';
+const BUILD = '2.13.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -1529,6 +1529,9 @@ function bankMoves(orders, purchases, payouts, ts, memberView = false) {
     // Members see company money as one pot: a cash expense counts when it's
     // spent, and withdrawals (just moving money) are left out.
     if (memberView && isCashExpense(p) && p.receivedAt >= ts) moves.push({ ts: p.receivedAt, text: esc(p.description), amt: -(p.amount || 0) });
+    // Members: paying back an expense from before the start date belongs to
+    // the time before it, like the money that paid for it.
+    if (memberView && isPersonal(p) && p.receivedAt < ts) return;
     if (hitsBank(p) && bankTs(p) >= ts) moves.push({
       ts: bankTs(p),
       text: isPersonal(p) ? `Paid back to ${esc(paidByLabel(p.paidBy))}: ${esc(p.description)}` : esc(p.description),
@@ -1536,6 +1539,10 @@ function bankMoves(orders, purchases, payouts, ts, memberView = false) {
     });
   });
   payouts.forEach(x => {
+    // Members: a profit share for a period that ended before the start date
+    // was earned before it too, so it's left out (else paying out old months
+    // later would push the members' balance below zero).
+    if (memberView && isSharePayout(x) && x.periodEnd <= ts) return;
     if (isSharePayout(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
     if (isDeposit(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Deposit from ${esc(x.from || 'private')}${x.note ? ': ' + esc(x.note) : ''}`, amt: x.amount, depositId: x.id });
     if (!memberView && isCashMove(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: x.toBank ? `Cash put back${x.note ? ': ' + esc(x.note) : ''}` : `Cash withdrawal${x.note ? ': ' + esc(x.note) : ''}`, amt: cashBankAmt(x), cashId: x.id });
