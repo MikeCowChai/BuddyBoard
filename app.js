@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.12.0';
+const BUILD = '2.13.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -1252,7 +1252,7 @@ async function renderSplit() {
   const withdrawn = sum('buffer', true);
   const inBuffer = tot.buffer - withdrawn;
   const openAmt = k => Math.max(0, allDue[k] - tot[k]);
-  const history = payouts.filter(x => !isDeposit(x)).sort((a, b) => b.paidAt - a.paidAt).slice(0, 12);
+  const history = payouts.filter(x => !isDeposit(x) && !isCashMove(x)).sort((a, b) => b.paidAt - a.paidAt).slice(0, 12);
 
   $('#money-split').innerHTML = `
     <div class="chip-row" id="splitChips">
@@ -1462,7 +1462,10 @@ const paidByLabel = pb => {
 };
 const isPersonal = p => p.paidBy === 'p1' || p.paidBy === 'p2';
 // offBook: settled outside the app (before it was tracked) — never touches the bank.
-const hitsBank = p => !isPersonal(p) || (p.reimbursed && !p.offBook);
+// cash: a company expense paid with cash taken out earlier — it comes out of
+// the cash box, the bank was already hit by the cash withdrawal.
+const isCashExpense = p => !isPersonal(p) && !!p.cash;
+const hitsBank = p => isPersonal(p) ? (p.reimbursed && !p.offBook) : !p.cash;
 /* When an expense leaves the bank: company-paid on the expense date; fronted
    by a person on the day the company paid them back (older records without
    that date fall back to the expense date). */
@@ -1473,12 +1476,27 @@ const isSharePayout = x => (x.kind === 'share1' || x.kind === 'share2') && !x.of
 /* Private money put into the company account (stored with the payouts,
    kind 'deposit', so only the admin can record it). Not revenue. */
 const isDeposit = x => x.kind === 'deposit';
+/* Cash moved between the bank and the company cash box (kind 'cash', admin
+   only like all payouts). Normally a withdrawal (bank → cash); toBank: true
+   is leftover cash put back (cash → bank). Not an expense, not revenue. */
+const isCashMove = x => x.kind === 'cash';
+const cashBankAmt = x => x.toBank ? x.amount : -x.amount;   // effect on the bank
 const bankInflowSince = (orders, payouts, ts) =>
   orders.filter(o => o.createdAt >= ts).reduce((s, o) => s + o.total, 0)
-  + payouts.filter(x => isDeposit(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
+  + payouts.filter(x => isDeposit(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0)
+  + payouts.filter(x => isCashMove(x) && x.toBank && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
 const bankOutflowSince = (purchases, payouts, ts) =>
   purchases.filter(p => hitsBank(p) && bankTs(p) >= ts).reduce((s, p) => s + (p.amount || 0), 0)
-  + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
+  + payouts.filter(x => isSharePayout(x) && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0)
+  + payouts.filter(x => isCashMove(x) && !x.toBank && x.paidAt >= ts).reduce((s, x) => s + x.amount, 0);
+/* Cash box: everything taken out of the bank minus cash spent / put back. */
+function cashBox(purchases, payouts) {
+  const moves = [
+    ...payouts.filter(isCashMove).map(x => ({ ts: x.paidAt, text: x.toBank ? `Cash put back in the bank${x.note ? ': ' + esc(x.note) : ''}` : `Cash withdrawal${x.note ? ': ' + esc(x.note) : ''}`, amt: -cashBankAmt(x), cashId: x.id })),
+    ...purchases.filter(isCashExpense).map(p => ({ ts: p.receivedAt, text: esc(p.description), amt: -(p.amount || 0) }))
+  ].sort((a, b) => b.ts - a.ts);
+  return { moves, balance: moves.reduce((t, m) => t + m.amt, 0), used: moves.length > 0 };
+}
 /* Mark expenses as paid back, dated today. From the bank (default) they
    count against the bank balance; offBook (cash / private) they never do. */
 async function markReimbursed(list, offBook = false, at = Date.now()) {
@@ -1504,10 +1522,13 @@ async function computeBank() {
 
 /* Everything that moved money in or out of the company since ts:
    orders in; company expenses, pay-backs and paid-out shares out. */
-function bankMoves(orders, purchases, payouts, ts) {
+function bankMoves(orders, purchases, payouts, ts, memberView = false) {
   const moves = [];
   orders.forEach(o => { if (o.createdAt >= ts) moves.push({ ts: o.createdAt, text: `${orderNo(o)} — ${esc(o.customerName)}`, amt: o.total }); });
   purchases.forEach(p => {
+    // Members see company money as one pot: a cash expense counts when it's
+    // spent, and withdrawals (just moving money) are left out.
+    if (memberView && isCashExpense(p) && p.receivedAt >= ts) moves.push({ ts: p.receivedAt, text: esc(p.description), amt: -(p.amount || 0) });
     if (hitsBank(p) && bankTs(p) >= ts) moves.push({
       ts: bankTs(p),
       text: isPersonal(p) ? `Paid back to ${esc(paidByLabel(p.paidBy))}: ${esc(p.description)}` : esc(p.description),
@@ -1517,6 +1538,7 @@ function bankMoves(orders, purchases, payouts, ts) {
   payouts.forEach(x => {
     if (isSharePayout(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Profit share to ${esc(payoutLabel(x.kind))} · ${esc(x.periodLabel)}`, amt: -x.amount });
     if (isDeposit(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: `Deposit from ${esc(x.from || 'private')}${x.note ? ': ' + esc(x.note) : ''}`, amt: x.amount, depositId: x.id });
+    if (!memberView && isCashMove(x) && x.paidAt >= ts) moves.push({ ts: x.paidAt, text: x.toBank ? `Cash put back${x.note ? ': ' + esc(x.note) : ''}` : `Cash withdrawal${x.note ? ': ' + esc(x.note) : ''}`, amt: cashBankAmt(x), cashId: x.id });
   });
   return moves.sort((a, b) => b.ts - a.ts);
 }
@@ -1542,7 +1564,7 @@ function monthlyFlowsHTML(moves, fromTs) {
 const movesListHTML = moves => `
   <div class="card">
     ${moves.slice(0, 15).map(m => `
-      <div class="flow-row ${m.depositId && isAdmin() ? 'is-tappable' : ''}" ${m.depositId && isAdmin() ? `data-deposit="${m.depositId}"` : ''} style="padding:8px 4px">
+      <div class="flow-row ${(m.depositId || m.cashId) && isAdmin() ? 'is-tappable' : ''}" ${m.depositId && isAdmin() ? `data-deposit="${m.depositId}"` : ''} ${m.cashId && isAdmin() ? `data-cashmove="${m.cashId}"` : ''} style="padding:8px 4px">
         <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.text}<span style="color:var(--md-on-surface-variant);font-size:12px"> · ${fmtDate(m.ts)}</span></span>
         <span style="flex:none;font-weight:600;${m.amt >= 0 ? 'color:var(--md-primary)' : 'color:var(--md-tertiary)'}">${m.amt >= 0 ? '+' : '−'}${fmtMoney(Math.abs(m.amt))}</span>
       </div>`).join('') || '<div class="empty">Nothing has moved yet.</div>'}
@@ -1555,7 +1577,7 @@ async function memberFlows() {
   const zero = memberZero();
   if (!zero) return null;
   const [orders, purchases, payouts] = await Promise.all([DB.getAll('orders'), DB.getAll('purchases'), DB.getAll('payouts')]);
-  const moves = bankMoves(orders, purchases, payouts, zero);
+  const moves = bankMoves(orders, purchases, payouts, zero, true);
   const inflow = moves.filter(x => x.amt > 0).reduce((t, x) => t + x.amt, 0);
   const outflow = -moves.filter(x => x.amt < 0).reduce((t, x) => t + x.amt, 0);
   return { zero, moves, inflow, outflow, balance: inflow - outflow };
@@ -1577,6 +1599,7 @@ async function renderBank() {
 
   const { cfg, inflow, outflow, balance, orders, purchases, payouts } = data;
   const moves = bankMoves(orders, purchases, payouts, cfg.ts);
+  const cash = cashBox(purchases, payouts);
   const zero = memberZero();
 
   $('#money-bank').innerHTML = `
@@ -1589,15 +1612,21 @@ async function renderBank() {
       <div class="stat-card">
         <div class="label">In since baseline</div>
         <div class="value">${fmtMoney(inflow)}</div>
-        <div class="hint">orders & deposits</div>
+        <div class="hint">orders, deposits, cash put back</div>
       </div>
       <div class="stat-card">
         <div class="label">Out since baseline</div>
         <div class="value">${fmtMoney(outflow)}</div>
-        <div class="hint">expenses, pay-backs, profit shares</div>
+        <div class="hint">pin expenses, cash withdrawals, pay-backs, profit shares</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Cash on hand</div>
+        <div class="value">${signedMoney(cash.balance)}</div>
+        <div class="hint">withdrawn minus spent in cash</div>
       </div>
     </div>
     <div class="report-actions" style="margin:12px 0 0">
+      <button class="btn-tonal" id="bankCash">Cash withdrawal…</button>
       <button class="btn-tonal" id="bankDeposit">Add deposit…</button>
       <button class="btn-tonal" id="bankUpdate">Update balance…</button>
     </div>
@@ -1605,11 +1634,19 @@ async function renderBank() {
     ${monthlyFlowsHTML(moves, cfg.ts)}
     <h2 class="section-label">Movements since baseline</h2>
     ${movesListHTML(moves)}
+    ${cash.used ? `<h2 class="section-label">Cash · ${signedMoney(cash.balance)} on hand</h2>${movesListHTML(cash.moves)}` : ''}
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">${zero ? `Members don't see this balance — they see in &amp; out since ${fmtDate(zero)} (Settings → Member balance starts…).` : 'Members don\'t see this balance. Set a start date for what they see in Settings → Member balance starts….'}</div>
     <div class="sub" style="font-size:12.5px;color:var(--md-on-surface-variant);margin-top:10px;padding:0 4px">Doesn't match your real bank? Private spending and fees aren't tracked here. Expenses someone paid personally come off the balance on the day the company pays them back (“Pay back” under Expenses) — just tap “Update balance” and re-enter the real number to re-anchor.</div>`;
 
   $('#bankUpdate').onclick = () => openBankSheet(balance);
   $('#bankDeposit').onclick = () => openDepositSheet();
+  $('#bankCash').onclick = () => openCashSheet(cash.balance);
+  document.querySelectorAll('[data-cashmove]').forEach(r => r.onclick = () => {
+    const x = payouts.find(y => y.id === Number(r.dataset.cashmove));
+    showConfirm(`Delete this ${x.toBank ? 'cash put back' : 'cash withdrawal'} of ${fmtMoney(x.amount)} (${fmtDate(x.paidAt)})?`, async () => {
+      await DB.delete('payouts', x.id); snack('Deleted'); render();
+    });
+  });
   document.querySelectorAll('[data-deposit]').forEach(r => r.onclick = () => {
     const x = payouts.find(y => y.id === Number(r.dataset.deposit));
     showConfirm(`Delete the deposit of ${fmtMoney(x.amount)} from ${x.from || 'private'} (${fmtDate(x.paidAt)})?`, async () => {
@@ -1643,6 +1680,34 @@ function openDepositSheet() {
     if (!ts) return snack('Pick a date');
     await DB.add('payouts', { kind: 'deposit', amount, from: $('#dpFrom').value, note: $('#dpNote').value.trim(), paidAt: ts, periodStart: ts, periodEnd: ts, periodLabel: fmtDate(ts) });
     closeSheet(); snack(`Deposit of ${fmtMoney(amount)} added`); render();
+  };
+}
+
+/* Admin: take cash out of the bank for purchases (or put leftover back). */
+function openCashSheet(onHand = 0) {
+  if (!requireAdmin()) return;
+  openSheet(`
+    <h2>Cash withdrawal</h2>
+    <p class="sheet-sub">Money taken out of the bank to pay in cash. It comes off the bank balance and goes into the cash box. Expenses you then log as “Company — cash” come out of the cash box, not the bank. Cash on hand now: ${signedMoney(onHand)}.</p>
+    <div class="form-card">
+      <div class="field-row">
+        <label class="field"><span>Amount (฿)</span><input id="csAmount" type="number" min="1" step="1" inputmode="numeric" placeholder="2000"></label>
+        <label class="field"><span>Date</span><input id="csDate" type="date" value="${tsToDateInput(Date.now())}" max="${tsToDateInput(Date.now())}"></label>
+      </div>
+      <label class="field"><span>Direction</span>
+        <select id="csDir"><option value="out">Taken out of the bank (ATM)</option><option value="back">Leftover cash put back in the bank</option></select>
+      </label>
+      <label class="field"><span>Note (optional)</span><input id="csNote" placeholder="e.g. market purchases"></label>
+      <button class="btn-filled" id="csSave">Save</button>
+    </div>`);
+  $('#csSave').onclick = async () => {
+    const amount = Math.round(Number($('#csAmount').value));
+    const ts = dateInputToTs($('#csDate').value);
+    if (!(amount > 0)) return snack('Enter an amount greater than 0');
+    if (!ts || ts > Date.now()) return snack('Pick a date that is not in the future');
+    const toBank = $('#csDir').value === 'back';
+    await DB.add('payouts', { kind: 'cash', amount, ...(toBank ? { toBank: true } : {}), note: $('#csNote').value.trim(), paidAt: ts, periodStart: ts, periodEnd: ts, periodLabel: fmtDate(ts) });
+    closeSheet(); snack(toBank ? `${fmtMoney(amount)} cash put back in the bank` : `${fmtMoney(amount)} withdrawn — now in the cash box`); render();
   };
 }
 
@@ -1869,7 +1934,7 @@ async function renderPurchases() {
         <div class="row">
           <div class="row-main">
             <div class="name">${esc(p.description)}</div>
-            <div class="sub">${cat(p)}${p.supplier ? ' · ' + esc(p.supplier) : ''} · ${fmtDate(p.receivedAt)}</div>
+            <div class="sub">${cat(p)}${p.supplier ? ' · ' + esc(p.supplier) : ''} · ${fmtDate(p.receivedAt)}${isAdmin() && isCashExpense(p) ? ' · cash' : ''}</div>
             ${isPersonal(p) ? (p.reimbursed
               ? `<span class="badge badge-ok"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · reimbursed${isAdmin() && p.offBook ? ' outside the bank' : ''}</span>`
               : `<span class="badge badge-low"><span class="dot"></span>Paid by ${esc(paidByLabel(p.paidBy))} · not reimbursed</span>`) : ''}
@@ -1937,7 +2002,8 @@ function openPurchaseForm(p) {
         <label class="field"><span>Date</span><input type="date" id="peDate" value="${tsToDateInput(p.receivedAt)}"></label>
         <label class="field"><span>Paid by</span>
           <select id="pePaidBy">
-            <option value="company" ${pb === 'company' ? 'selected' : ''}>Company</option>
+            <option value="company" ${pb === 'company' && !(isAdmin() && p.cash) ? 'selected' : ''}>${isAdmin() ? 'Company — pin / bank' : 'Company'}</option>
+            ${isAdmin() ? `<option value="company_cash" ${pb === 'company' && p.cash ? 'selected' : ''}>Company — cash</option>` : ''}
             <option value="p1" ${pb === 'p1' ? 'selected' : ''}>${esc(cfg.name1)}</option>
             <option value="p2" ${pb === 'p2' ? 'selected' : ''}>${esc(cfg.name2)}</option>
           </select>
@@ -1959,8 +2025,9 @@ function openPurchaseForm(p) {
       <label class="field"><span>Supplier (optional)</span><input id="peSupplier" value="${esc(p.supplier || '')}" placeholder="e.g. Northline Supply"></label>
       <button class="btn-filled" id="peSave">${isNew ? 'Log expense' : 'Save changes'}</button>
     </div>`);
-  const syncReimb = () => { if ($('#peReimbDetails')) $('#peReimbDetails').hidden = $('#pePaidBy').value === 'company' || !$('#peReimbursed').checked; };
-  $('#pePaidBy').onchange = e => { $('#peReimburseWrap').hidden = e.target.value === 'company'; syncReimb(); };
+  const isCo = v => v === 'company' || v === 'company_cash';
+  const syncReimb = () => { if ($('#peReimbDetails')) $('#peReimbDetails').hidden = isCo($('#pePaidBy').value) || !$('#peReimbursed').checked; };
+  $('#pePaidBy').onchange = e => { $('#peReimburseWrap').hidden = isCo(e.target.value); syncReimb(); };
   $('#peReimbursed').onchange = syncReimb;
   if (isNew && matchMedia('(pointer: fine)').matches) $('#peDescription').focus();
   $('#peSave').onclick = async () => {
@@ -1970,7 +2037,10 @@ function openPurchaseForm(p) {
     if (!description) return snack('Enter what you bought');
     if (!(amount > 0)) return snack('Enter an amount greater than 0');
     if (!ts) return snack('Pick a date');
-    const paidBy = $('#pePaidBy').value;
+    const pbVal = $('#pePaidBy').value;
+    const paidBy = pbVal === 'company_cash' ? 'company' : pbVal;
+    // Only the admin chooses pin or cash; a member's edit keeps what was stored.
+    const cash = paidBy === 'company' && (isAdmin() ? pbVal === 'company_cash' : !!p.cash);
     const reimbursed = paidBy === 'company' ? false : $('#peReimbursed').checked;
     // The admin picks when and how it was paid back; otherwise keep what was stored.
     let reimbursedAt, offBook = false;
@@ -1983,12 +2053,12 @@ function openPurchaseForm(p) {
     }
     await DB.put('purchases', {
       ...p, description, amount, category: $('#peCategory').value,
-      paidBy, reimbursed, reimbursedAt, offBook,
+      paidBy, cash, reimbursed, reimbursedAt, offBook,
       supplier: $('#peSupplier').value.trim(), receivedAt: ts
     });
     closeSheet();
     snack(!isNew ? 'Expense updated'
-      : paidBy === 'company' ? `Logged ${fmtMoney(amount)} — ${description}`
+      : paidBy === 'company' ? `Logged ${fmtMoney(amount)} — ${description}${cash && isAdmin() ? ' (cash)' : ''}`
       : `Logged ${fmtMoney(amount)} — fronted by ${paidByLabel(paidBy)}${reimbursed ? ', already paid back' : ' (not paid back yet)'}`);
     render();
   };
