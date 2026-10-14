@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.15.0';
+const BUILD = '2.16.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -985,10 +985,10 @@ async function downloadReportXlsx() {
     ['Costs by category', ''],
     ...d.cats
   ];
-  const orders = [['Date', 'Order', 'Customer', 'Items', 'Subtotal', 'Discount %', 'Total', 'Status'],
+  const orders = [['Date', 'Order', 'Customer', 'Items', 'Subtotal', 'Discount %', 'Total', 'Status', 'Tracking'],
     ...d.pOrders.map(o => [day(o.createdAt), orderNo(o), o.customerName,
       o.items.map(i => i.unitType === 'weight' ? `${fmtGrams(i.qty)} ${i.name}` : `${i.qty}x ${i.name}`).join(', '),
-      o.subtotal ?? o.total, o.discountPct || 0, o.total, o.status]),
+      o.subtotal ?? o.total, o.discountPct || 0, o.total, o.status, o.tracking || '']),
     [], ['Total', '', '', '', '', '', d.revenue]];
   const expenses = [['Date', 'Description', 'Category', 'Supplier', 'Paid by', 'Paid back on', 'Amount'],
     ...d.pExpenses.map(p => [day(p.receivedAt), p.description, p.category || 'Other', p.supplier || '',
@@ -2178,6 +2178,16 @@ async function openProductForm(id) {
 }
 
 /* ----- Orders ----- */
+/* Tracking: a full link, or just a code. Links open in a new tab. */
+const trackingHref = t => /^https?:\/\//i.test(t || '') ? t : (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(t || '') ? 'https://' + t : null);
+function trackingHTML(o) {
+  if (!o.tracking) return '';
+  const href = trackingHref(o.tracking);
+  return `<div class="sub tracking-line">📦 ${href
+    ? `<a href="${esc(href)}" target="_blank" rel="noopener" data-trk>Tracking</a>`
+    : `Tracking: ${esc(o.tracking)}`}</div>`;
+}
+
 function railHTML(order) {
   const idx = STATUSES.indexOf(order.status);
   const last = STATUSES.length - 1;
@@ -2197,6 +2207,7 @@ async function renderOrders() {
     o.customerName.toLowerCase().includes(q) ||
     String(o.seq ?? o.id).includes(q) ||
     orderNo(o).toLowerCase().includes(q) ||
+    (o.tracking || '').toLowerCase().includes(q) ||
     o.items.some(i => i.name.toLowerCase().includes(q)));
   if (state.statusFilter === 'open') list = list.filter(o => o.status !== 'Delivered');
   else if (state.statusFilter !== 'all') list = list.filter(o => o.status === state.statusFilter);
@@ -2213,6 +2224,7 @@ async function renderOrders() {
           <div class="name">${orderNo(o)} · ${esc(o.customerName)}</div>
           <div class="sub">${esc(o.address)}</div>
           <div class="sub">${o.items.map(i => itemLabel(i)).join(', ')}</div>
+          ${trackingHTML(o)}
           ${waiting.length ? `<span class="badge badge-low"><span class="dot"></span>Awaiting stock: ${waiting.map(i => itemLabel(i, i.pendingQty)).join(', ')}</span>` : ''}
         </div>
         <div class="row-end">
@@ -2230,7 +2242,7 @@ async function renderOrders() {
     const o = list.find(x => x.id === Number(wrap.dataset.oid));
     const card = wrap.querySelector('.card');
     card.classList.add('is-tappable');
-    card.addEventListener('click', () => openOrderOptions(o));
+    card.addEventListener('click', e => { if (e.target.closest('[data-trk]')) return; openOrderOptions(o); });
     attachLongPress(card, () => openOrderOptions(o));
   });
 
@@ -2485,6 +2497,8 @@ function openOrderOptions(o) {
     <h2>${orderNo(o)} · ${esc(o.customerName)}</h2>
     <div class="form-card">
       <button class="btn-tonal" id="ooEdit">Edit order…</button>
+      <button class="btn-tonal" id="ooAgain">Order again — same items for ${esc(o.customerName)}</button>
+      <button class="btn-tonal" id="ooTracking">${o.tracking ? 'Tracking link — change' : 'Add tracking link'}</button>
       <button class="btn-tonal" id="ooShare">Share receipt</button>
       <button class="btn-tonal" id="ooDate">Change order date & time</button>
       <button class="btn-tonal" id="ooNumber">Change order number</button>
@@ -2493,6 +2507,32 @@ function openOrderOptions(o) {
     </div>`);
 
   $('#ooEdit').onclick = () => openOrderEdit(o);
+  $('#ooAgain').onclick = () => openOrderForm(o);
+  $('#ooTracking').onclick = () => {
+    const href = trackingHref(o.tracking);
+    openSheet(`
+      <h2>Tracking — ${orderNo(o)}</h2>
+      <p class="sheet-sub">For your records. Paste the tracking link (or just the tracking number).</p>
+      <div class="form-card">
+        <label class="field"><span>Tracking link or number</span><input id="otLink" type="url" inputmode="url" value="${esc(o.tracking || '')}" placeholder="https://… or TH123456789"></label>
+        <button class="btn-filled" id="otSave">Save</button>
+        ${href ? `<a class="btn-tonal" href="${esc(href)}" target="_blank" rel="noopener" style="text-align:center;text-decoration:none">Open tracking page</a>` : ''}
+        ${o.tracking ? '<button class="btn-text danger" id="otClear">Remove tracking</button>' : ''}
+      </div>`);
+    if (matchMedia('(pointer: fine)').matches) $('#otLink').focus();
+    $('#otSave').onclick = async () => {
+      const v = $('#otLink').value.trim();
+      const fresh = await DB.get('orders', o.id);
+      await DB.put('orders', { ...fresh, tracking: v || undefined });
+      closeSheet(); snack(v ? `Tracking saved for ${orderNo(o)}` : 'Tracking removed'); render();
+    };
+    if ($('#otClear')) $('#otClear').onclick = async () => {
+      const fresh = await DB.get('orders', o.id);
+      const { tracking, ...rest } = fresh;
+      await DB.put('orders', rest);
+      closeSheet(); snack('Tracking removed'); render();
+    };
+  };
   $('#ooShare').onclick = () => shareReceipt(o);
 
   $('#ooDate').onclick = () => {
@@ -2576,7 +2616,10 @@ function openOrderOptions(o) {
 }
 
 /* ----- Order form ----- */
-async function openOrderForm() {
+/* New order — or, given a previous order, "order again": same customer,
+   address and items, at today's prices and with the customer's standard
+   discount (else the old order's discount). */
+async function openOrderForm(from) {
   const [products, customers] = await Promise.all([DB.getAll('products'), DB.getAll('customers')]);
   if (!products.length) return snack('Add products in Inventory before creating orders');
   products.sort((a, b) => a.name.localeCompare(b.name));
@@ -2589,12 +2632,22 @@ async function openOrderForm() {
     weightBased: isWeight(p)
   });
   let lines = [newLine()];
+  const skipped = [];
+  if (from) {
+    const again = from.items.map(i => {
+      const p = products.find(x => x.id === i.productId);
+      if (!p) { skipped.push(i.name); return null; }
+      return { ...newLine(p), qty: i.qty };
+    }).filter(Boolean);
+    if (again.length) lines = again;
+  }
 
   const productOptions = sel => products.map(p =>
     `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${esc(p.name)} (${p.trackStock === false ? MODE_TAGS[stockMode(p)] : fmtStock(p) + ' left'})</option>`).join('');
 
   openSheet(`
-    <h2>New order</h2>
+    <h2>${from ? 'Order again' : 'New order'}</h2>
+    ${from ? `<p class="sheet-sub">Copied from ${orderNo(from)} (${fmtDate(from.createdAt)}) at today's prices${skipped.length ? ` — left out (product no longer exists): ${skipped.map(esc).join(', ')}` : ''}. Change anything you like.</p>` : ''}
     <div class="form-card">
       <label class="field" style="position:relative"><span>Customer</span>
         <input id="ofCustomerSearch" placeholder="Search customers, or type a new name" autocomplete="off">
@@ -2722,6 +2775,13 @@ async function openOrderForm() {
     },
     onNew: () => $('#ofPhone').focus()
   });
+  if (from) {
+    const c = customers.find(x => x.id === from.customerId);
+    $('#ofCustomerSearch').value = c ? c.name : from.customerName;
+    $('#ofAddress').value = from.address || (c && c.address) || '';
+    if (c) { pickedCustomer = c; setAutoDiscount(c); }
+    if (!(c && c.discountPct > 0) && from.discountPct > 0) { $('#ofDiscount').value = from.discountPct; updateTotal(); }
+  }
 
   $('#ofCreate').onclick = async () => {
     const typed = $('#ofCustomerSearch').value.trim();
