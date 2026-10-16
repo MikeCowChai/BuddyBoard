@@ -15,6 +15,9 @@
   --md-on-secondary-container: #181A2C;
 
   --md-tertiary: #805600;
+  --chart-rev: #4355B9;
+  --chart-cost: #EB6834;
+  --chart-stock: #1BAF7A;
   --bb-stock: #2E7D5B;
   --md-tertiary-container: #FFDDB1;
   --md-on-tertiary-container: #291800;
@@ -62,6 +65,9 @@
   --md-on-secondary-container: #E0E1F9;
 
   --md-tertiary: #FABD49;
+  --chart-rev: #3987E5;
+  --chart-cost: #D95926;
+  --chart-stock: #199E70;
   --bb-stock: #7FD3A8;
   --md-tertiary-container: #614000;
   --md-on-tertiary-container: #FFDDB1;
@@ -98,6 +104,9 @@
     --md-on-secondary-container: #E0E1F9;
 
     --md-tertiary: #FABD49;
+    --chart-rev: #3987E5;
+    --chart-cost: #D95926;
+    --chart-stock: #199E70;
     --bb-stock: #7FD3A8;
     --md-tertiary-container: #614000;
     --md-on-tertiary-container: #FFDDB1;
@@ -485,21 +494,22 @@ details.section[open] > summary::before { transform: rotate(90deg); }
 
 /* ---------- Revenue chart ---------- */
 .chart { display: flex; align-items: flex-end; gap: 8px; height: 150px; padding-top: 8px; }
-.chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 5px; height: 100%; min-width: 0; }
-.chart-val { font-size: 10.5px; color: var(--md-on-surface-variant); white-space: nowrap; }
-.chart-bars { display: flex; gap: 3px; width: 100%; height: 100%; align-items: flex-end; justify-content: center; }
-.chart-bar { width: 100%; max-width: 22px; border-radius: 5px 5px 2px 2px; background: var(--md-primary); opacity: .45; min-height: 2px; }
-.chart-bar.cost { background: var(--md-tertiary); }
-.chart-bar.stock { background: var(--bb-stock); }
-.chart-col.is-current .chart-bar { opacity: 1; }
+.chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 5px; height: 100%; min-width: 0;
+  padding: 4px 0 2px; border-radius: 8px; background: none; border: 0; font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.chart-col.is-sel { background: var(--md-surface-container); }
+.chart-bars { display: flex; gap: 2px; width: 100%; height: 100%; align-items: flex-end; justify-content: center; }
+.chart-bar { width: 100%; max-width: 14px; border-radius: 4px 4px 0 0; background: var(--chart-rev); opacity: .5; min-height: 2px; }
+.chart-bar.cost { background: var(--chart-cost); }
+.chart-bar.stock { background: var(--chart-stock); }
+.chart-col.is-sel .chart-bar { opacity: 1; }
 .chart-label { font-size: 11px; color: var(--md-on-surface-variant); }
-.chart-col.is-current .chart-label { font-weight: 700; color: var(--md-on-surface); }
+.chart-col.is-sel .chart-label { font-weight: 700; color: var(--md-on-surface); }
 .chart-legend { display: flex; gap: 18px; justify-content: center; margin-top: 12px; font-size: 12.5px; color: var(--md-on-surface-variant); }
 .chart-legend > span { display: inline-flex; align-items: center; gap: 6px; }
 .legend-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-.legend-dot.rev { background: var(--md-primary); }
-.legend-dot.cost { background: var(--md-tertiary); }
-.legend-dot.stock { background: var(--bb-stock); }
+.legend-dot.rev { background: var(--chart-rev); }
+.legend-dot.cost { background: var(--chart-cost); }
+.legend-dot.stock { background: var(--chart-stock); }
 
 /* ---------- Top customers bars ---------- */
 .tc-row { display: grid; grid-template-columns: minmax(70px, 100px) 1fr auto; gap: 10px; align-items: center; padding: 6px 0; }
@@ -690,3 +700,12 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .ref-totals b { color: var(--md-on-surface); }
 
 .tracking-line a { color: var(--md-primary); font-weight: 600; text-decoration: none; }
+
+.chart-detail { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--md-outline-variant); }
+.cd-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; }
+.cd-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 14px; }
+.cd-row > span { display: inline-flex; align-items: center; gap: 8px; color: var(--md-on-surface-variant); }
+.cd-row b { font-weight: 600; color: var(--md-on-surface); }
+.cd-profit { border-top: 1px dashed var(--md-outline-variant); border-bottom: 1px dashed var(--md-outline-variant); margin: 2px 0; }
+.cd-profit > span { padding-left: 18px; }
+.cd-note { font-size: 12px; color: var(--md-on-surface-variant); margin-top: 6px; }

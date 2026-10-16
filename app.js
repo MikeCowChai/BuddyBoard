@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.16.1';
+const BUILD = '2.17.0';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -736,6 +736,18 @@ async function renderHome() {
 /* Value of an amount of a product at its selling price (weight: per kg). */
 const stockLineValue = (p, qty) => p.unit === 'weight' ? Math.floor(qty / 1000 * (p.price || 0)) : qty * (p.price || 0);
 
+/* Numbers for the month tapped in the Reports chart. */
+function chartDetailHTML(m) {
+  const profit = m.rev - m.cost;
+  return `
+    <div class="cd-title">${esc(m.full)}</div>
+    <div class="cd-row"><span><span class="legend-dot rev"></span>Revenue</span><b>${fmtMoney(m.rev)}</b></div>
+    <div class="cd-row"><span><span class="legend-dot cost"></span>Costs</span><b>${fmtMoney(m.cost)}</b></div>
+    <div class="cd-row cd-profit"><span>Profit (revenue − costs)</span><b>${profit < 0 ? '−' + fmtMoney(-profit) : fmtMoney(profit)}</b></div>
+    <div class="cd-row"><span><span class="legend-dot stock"></span>Stock made</span><b>${fmtMoney(m.made)}</b></div>
+    <div class="cd-note">Stock made = added to stock that month, at selling price. Not sold yet, so not in profit.</div>`;
+}
+
 async function renderReports() {
   const [orders, products, purchases, stocklog] = await Promise.all([
     DB.getAll('orders'), DB.getAll('products'), DB.getAll('purchases'), DB.getAll('stocklog')
@@ -760,8 +772,9 @@ async function renderReports() {
     const rev = orders.filter(o => o.createdAt >= s && o.createdAt < e).reduce((sum, o) => sum + o.total, 0);
     const cost = purchases.filter(pu => pu.receivedAt >= s && pu.receivedAt < e).reduce((sum, pu) => sum + (pu.amount || 0), 0);
     const made = stocklog.filter(x => x.ts >= s && x.ts < e).reduce((sum, x) => sum + (x.value || 0), 0);
-    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), rev, cost, made, current: k === 5 };
+    return { label: new Date(s).toLocaleDateString(undefined, { month: 'short' }), full: new Date(s).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }), rev, cost, made, current: k === 5 };
   });
+  const chartSel = Number.isInteger(state.chartSel) ? state.chartSel : 5;
   const maxRev = Math.max(1, ...monthly.map(m => Math.max(m.rev, m.cost, m.made)));
   const periodMade = stocklog.filter(x => x.ts >= per.start && x.ts < per.end).reduce((sum, x) => sum + (x.value || 0), 0);
 
@@ -827,24 +840,23 @@ async function renderReports() {
     </div>
     <h2 class="section-label">Revenue, costs & stock made · last 6 months</h2>
     <div class="card">
-      <div class="chart">
-        ${monthly.map(m => `
-          <div class="chart-col ${m.current ? 'is-current' : ''}">
-            <span class="chart-val">${m.rev ? fmtCompact(m.rev) : ''}</span>
+      <div class="chart" role="group" aria-label="Revenue, costs and stock made per month — tap a month for the numbers">
+        ${monthly.map((m, mi) => `
+          <button class="chart-col ${m.current ? 'is-current' : ''} ${mi === chartSel ? 'is-sel' : ''}" data-mi="${mi}" aria-pressed="${mi === chartSel}" aria-label="${esc(m.full)}">
             <div class="chart-bars">
               <div class="chart-bar" style="height:${Math.round(m.rev / maxRev * 100)}%"></div>
               <div class="chart-bar cost" style="height:${Math.round(m.cost / maxRev * 100)}%"></div>
               <div class="chart-bar stock" style="height:${Math.round(m.made / maxRev * 100)}%"></div>
             </div>
             <span class="chart-label">${m.label}</span>
-          </div>`).join('')}
+          </button>`).join('')}
       </div>
       <div class="chart-legend">
         <span><span class="legend-dot rev"></span>Revenue</span>
         <span><span class="legend-dot cost"></span>Costs</span>
         <span><span class="legend-dot stock"></span>Stock made</span>
       </div>
-      <div class="sub" style="font-size:12px;color:var(--md-on-surface-variant);text-align:center;margin-top:6px">Stock made = what you added with “Add stock”, at selling price. Not sold yet, so not in profit.</div>
+      <div class="chart-detail" id="chartDetail">${chartDetailHTML(monthly[chartSel])}</div>
     </div>
     ${catRows.length ? `
     <h2 class="section-label">Costs by category · ${per.label}</h2>
@@ -879,6 +891,11 @@ async function renderReports() {
 
   document.querySelectorAll('#periodChips [data-period]').forEach(chip =>
     chip.addEventListener('click', () => { state.period = chip.dataset.period; state.periodOffset = 0; renderReports(); }));
+  document.querySelectorAll('.chart-col[data-mi]').forEach(col => col.onclick = () => {
+    state.chartSel = Number(col.dataset.mi);
+    document.querySelectorAll('.chart-col[data-mi]').forEach(c => { const on = c === col; c.classList.toggle('is-sel', on); c.setAttribute('aria-pressed', on); });
+    $('#chartDetail').innerHTML = chartDetailHTML(monthly[state.chartSel]);
+  });
   const prev = $('#periodPrev'), next = $('#periodNext');
   if (prev) prev.onclick = () => { state.periodOffset--; renderReports(); };
   if (next) next.onclick = () => { if (state.periodOffset < 0) { state.periodOffset++; renderReports(); } };
