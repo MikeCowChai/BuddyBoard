@@ -4,7 +4,7 @@
    possible to verify which version a device is actually running.
    Version scheme: MAJOR.MINOR.PATCH — PATCH for small fixes (2.0.1),
    MINOR for new features (2.1.0), MAJOR for big changes (3.0.0). */
-const BUILD = '2.16.0';
+const BUILD = '2.16.1';
 function showFatal(msg) {
   try {
     let b = document.getElementById('errBanner');
@@ -2090,6 +2090,10 @@ async function openProductForm(id) {
         </select>
       </label>
       <div id="pfStockFields">${stockFieldsHTML(unitType, tracked)}</div>
+      <label class="field-checkbox" id="pfMadeWrap" hidden>
+        <input type="checkbox" id="pfMade">
+        <span id="pfMadeText"></span>
+      </label>
       <label class="field-checkbox">
         <input type="checkbox" id="pfExclude" ${p.excludeReports ? 'checked' : ''}>
         <span>Exclude from sales reports — for shipping fees & extras that shouldn't count as a product sold</span>
@@ -2122,8 +2126,32 @@ async function openProductForm(id) {
     };
   }
   bindWeightUnitToggle();
-  $('#pfUnitType').onchange = redraw;
-  $('#pfStockMode').onchange = redraw;
+  $('#pfUnitType').onchange = () => { redraw(); syncMade(); };
+  $('#pfStockMode').onchange = () => { redraw(); syncMade(); };
+
+  /* Stock raised here: offer to count the extra as "stock made" (Reports).
+     Ticked by default when the product wasn't tracked before (new product,
+     or switched from made-to-order) — that first stock was really made. */
+  const wasTracked = !!id && tracked;
+  const oldStock = wasTracked ? (p.stock || 0) : 0;
+  let madeTouched = false;
+  const formStock = () => {
+    if ($('#pfStockMode').value !== 'tracked' || !$('#pfStock')) return 0;
+    const v = Number($('#pfStock').value) || 0;
+    return $('#pfUnitType').value === 'weight' ? Math.round(v * (weightUnit === 'kg' ? 1000 : 1)) : Math.max(0, v);
+  };
+  function syncMade() {
+    const delta = formStock() - ($('#pfUnitType').value === (p.unit === 'weight' ? 'weight' : 'pcs') ? oldStock : 0);
+    const show = delta > 0;
+    $('#pfMadeWrap').hidden = !show;
+    if (!show) return;
+    $('#pfMadeText').textContent = `Count the extra ${$('#pfUnitType').value === 'weight' ? fmtGrams(delta) : delta + ' pcs'} as stock made this month (Reports) — leave unticked for a correction`;
+    if (!madeTouched) $('#pfMade').checked = !wasTracked;
+  }
+  $('#pfMade').onchange = () => { madeTouched = true; };
+  $('#pfStockFields').addEventListener('input', syncMade);
+  $('#pfStockFields').addEventListener('change', syncMade);
+  syncMade();
 
   $('#pfSave').onclick = async () => {
     const name = $('#pfName').value.trim();
@@ -2158,6 +2186,13 @@ async function openProductForm(id) {
       isDelivery: p.isDelivery || false
     };
     const savedId = await DB.put('products', record);
+    // Optionally log the increase for "Stock made" in Reports.
+    const sameUnit = finalUnitType === (p.unit === 'weight' ? 'weight' : 'pcs');
+    const madeDelta = trackStock ? stock - (sameUnit ? oldStock : 0) : 0;
+    if (madeDelta > 0 && $('#pfMade').checked) {
+      await DB.add('stocklog', { productId: id || savedId, name, qty: madeDelta, unitType: finalUnitType === 'weight' ? 'weight' : 'piece',
+        value: stockLineValue({ unit: finalUnitType, price }, madeDelta), ts: Date.now(), source: 'product form' });
+    }
     // New stock first goes to orders that were waiting for it (oldest first).
     let allocMsg = '';
     if (record.trackStock && record.stock > 0) {
